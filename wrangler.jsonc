@@ -7,9 +7,12 @@
   "name": "suno-worker",
   "main": "src/index.ts",
   "compatibility_date": "2025-02-14",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   "observability": {
     "enabled": true
-  }
+  },
   /**
    * Smart Placement
    * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -22,6 +25,13 @@
    * databases, object storage, AI inference, real-time communication and more.
    * https://developers.cloudflare.com/workers/runtime-apis/bindings/
    */
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "c76ea05d52fe4158a0d763a9f6af4846",
+      "preview_id": "c76ea05d52fe4158a0d763a9f6af4846"
+    }
+  ],
 
   /**
    * Environment Variables
@@ -44,4 +54,7 @@
    * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
    */
   // "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
+  "browser": {
+    "binding": "BROWSER"
+  }
 }
