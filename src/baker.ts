@@ -2,25 +2,12 @@ import * as cookie from 'cookie';
 import type { SerializeOptions } from 'cookie';
 
 export class Baker {
-    private env: Env
-    private ctx: ExecutionContext
-
     public cookies: Record<string, string | undefined>;
 
-    private constructor(env: Env, ctx: ExecutionContext, cookie_header?: string) {
-        this.env = env;
-        this.ctx = ctx;
-
+    constructor(env: Env) {
         this.cookies = {
-            ...cookie.parse(env.DOC_COOKIE),
             ...cookie.parse(env.SUNO_COOKIE),
-            ...(cookie_header && cookie.parse(cookie_header)),
         }
-    }
-
-    public static async create(env: Env, ctx: ExecutionContext): Promise<Baker> {
-        const cookie_header = await env.KV.get('COOKIE_HEADER') || undefined;
-        return new Baker(env, ctx, cookie_header);
     }
 
     // NOTE update the page cookies?
@@ -28,14 +15,12 @@ export class Baker {
 
     public addCookies(cookies: Record<string, string | undefined>) {
         this.cookies = { ...this.cookies, ...cookies };
-        this.ctx.waitUntil(this.env.KV.put('COOKIE_HEADER', this.getCookieHeader()));
     }
     public addCookie(name: string, val: string, options: SerializeOptions) {
         let cookie_str = cookie.serialize(name, val, options);
         let cookie_rec = cookie.parse(cookie_str);
 
         this.cookies = { ...this.cookies, ...cookie_rec };
-        this.ctx.waitUntil(this.env.KV.put('COOKIE_HEADER', this.getCookieHeader()));
     }
     public getCookieHeader() {
         const cookie_arr = Object

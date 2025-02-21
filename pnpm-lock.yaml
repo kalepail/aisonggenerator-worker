@@ -17,6 +17,9 @@ importers:
       cookie:
         specifier: ^1.0.2
         version: 1.0.2
+      itty-router:
+        specifier: ^5.0.18
+        version: 5.0.18
     devDependencies:
       '@cloudflare/puppeteer':
         specifier: ^0.0.14
@@ -653,6 +656,9 @@ packages:
   is-fullwidth-code-point@3.0.0:
     resolution: {integrity: sha512-zymm5+u+sCsSWyD9qNaejV3DFvhCKclKdizYaJUuHA83RLjb7nSuGnddCHGv0hk+KY7BMAlsWeK4Ueg6EV6XQg==}
     engines: {node: '>=8'}
+
+  itty-router@5.0.18:
+    resolution: {integrity: sha512-mK3ReOt4ARAGy0V0J7uHmArG2USN2x0zprZ+u+YgmeRjXTDbaowDy3kPcsmQY6tH+uHhDgpWit9Vqmv/4rTXwA==}
 
   jsbn@1.1.0:
     resolution: {integrity: sha512-4bYVV3aAMtDTTu4+xsDYa6sy9GyJ69/amsu9sYF2zqjiEoZA5xJi3BrfX3uY+/IekIu7MwdObdbDWpoZdBv3/A==}
@@ -1479,6 +1485,8 @@ snapshots:
     optional: true
 
   is-fullwidth-code-point@3.0.0: {}
+
+  itty-router@5.0.18: {}
 
   jsbn@1.1.0: {}
 
