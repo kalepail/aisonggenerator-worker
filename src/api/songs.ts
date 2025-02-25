@@ -16,7 +16,7 @@ export async function getSongs(req: RequestLike, env: Env) {
     filters = filters.slice(0, -1)
 
     const res = await supabase
-        .get(`/rest/v1/music?select=status,audio&user_id=eq.${env.AISONGGENERATOR_USER_ID}&or=(${filters})`, 
+        .get(`/rest/v1/music?select=music_id,status,audio&user_id=eq.${env.AISONGGENERATOR_USER_ID}&or=(${filters})`, 
             {}, 
             {
                 headers: {

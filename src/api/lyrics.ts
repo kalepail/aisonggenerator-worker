@@ -1,6 +1,3 @@
-// https://lyrics-generator.tommy-ni1997.workers.dev
-// https://aisonggenerator.io/api/lyrics-generate
-
 import { fetcher } from "itty-fetcher";
 import { json, RequestLike } from "itty-router";
 
