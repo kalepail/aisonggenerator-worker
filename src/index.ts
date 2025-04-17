@@ -1,36 +1,52 @@
-import { IttyRouter, cors, withParams, status, error } from 'itty-router'
 import { lyrics } from './api/lyrics';
 import { getSongs, postSongs } from './api/songs';
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+import { HTTPException } from 'hono/http-exception'
 
 export { DO } from "./do";
 
-const { preflight, corsify } = cors()
-const router = IttyRouter()
+export const app = new Hono<{Bindings: Env}>()
 
-router
-    .options('*', preflight)
-    .all('*', withParams)
+app
+    .all('*', cors())
     .post('/api/lyrics', lyrics)
-    .get('/api/songs', getSongs)
     .post('/api/songs', postSongs)
-    .all('*', () => status(404))
+    .get('/api/songs', getSongs)
+    // .get('/api/token', async (ctx) => {
+    //     const { env } = ctx 
+    //     const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
+    //     const stub = env.DURABLE_OBJECT.get(doid);
 
-const handler = {
-    fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
-        router
-            .fetch(req, env, ctx)
-            .catch((err: any) => {
-                console.error(err);
-                return error(err?.status ?? 400, err)
-            })
-            .then((res: Response) => corsify(res, req)),
-    
-    async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    //     const { error } = await stub.getTokens();
+
+    //     if (error) {
+    //         throw new HTTPException(400, { res: ctx.json(error, 400) });
+    //     }
+
+    //     return ctx.body(null, 204);
+    // })
+    .onError((err, ctx) => {
+        console.error(err)
+
+        if (err instanceof HTTPException) {
+            return err.getResponse()
+        } else {
+            return ctx.text(err.message, 500)
+        }
+    })
+    .notFound((ctx) => ctx.body(null, 404))
+
+export default {
+    fetch: app.fetch,
+    async scheduled(ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
         const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
         const stub = env.DURABLE_OBJECT.get(doid);
-        
-        await stub.getTokens();
-    }
-} satisfies ExportedHandler<Env>;
 
-export default { ...handler }
+        const { error } = await stub.getTokens();
+
+        if (error) {
+            console.error(error)
+        }
+    },
+}

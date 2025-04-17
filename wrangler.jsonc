@@ -4,14 +4,17 @@
  */
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "suno-worker",
+  "name": "aisonggenerator-worker",
   "main": "src/index.ts",
   "compatibility_date": "2025-02-14",
   // "compatibility_flags": [
   //   "nodejs_compat"
   // ],
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "invocation_logs": false
+    }
   },
   // "rules": [
   //   {
