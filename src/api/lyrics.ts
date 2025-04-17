@@ -4,7 +4,7 @@ import { HTTPException } from "hono/http-exception";
 // TODO use this if the below fails https://aisonggenerator.io/api/lyrics-generate
 // Consider using the suno lyrics generator
 
-export async function lyrics(ctx: Context) {
+export async function lyrics(ctx: Context<{ Bindings: Env }>) {
     const { req } = ctx
     const lyrics: LyricsResponse = await fetch('https://lyrics-generator.tommy-ni1997.workers.dev', {
         method: 'POST',

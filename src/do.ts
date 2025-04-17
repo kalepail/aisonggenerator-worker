@@ -1,29 +1,40 @@
 import { DurableObject } from 'cloudflare:workers';
 
 export class DO extends DurableObject<Env> {
+    private refreshing = false;
+
     constructor(state: DurableObjectState, env: Env) {
         super(state, env);
-        state.blockConcurrencyWhile(() => this.getTokens());
     }
 
-    async getTokens() {
-        const expires_at = await this.ctx.storage.get<number>('expires_at');
-        const ten_minutes_in_ms = 10 * 60 * 1000;
-
+    async getTokens(refresh = false) {
         // NOTE: Currently tokens are good for 1 hour
 
-        if (
-            !expires_at 
-            || (Date.now() + ten_minutes_in_ms) > (expires_at * 1000)
-        ) {
-            try {
-                console.log('Refreshing token');
-                await this.refreshToken();
-            } catch (err) {
-                return { error: err };
+        if (refresh) {
+            const expires_at = await this.ctx.storage.get<number>('expires_at') || 0;
+            const ten_minutes_in_ms = 10 * 60 * 1000;
+            const now = Date.now();
+
+            if (
+                !this.refreshing
+                && (
+                    !expires_at
+                    || (now + ten_minutes_in_ms) > (expires_at * 1000)
+                )
+            ) {
+                try {
+                    this.refreshing = true;
+                    console.log('Refreshing token');
+                    await this.refreshToken();
+                } catch (err) {
+                    return { error: err };
+                } finally {
+                    this.refreshing = false;
+                }
+            } else {
+                const secondsRemaining = Math.floor(((expires_at * 1000) - (now + ten_minutes_in_ms)) / 1000);
+                console.log('Token is still valid, seconds remaining:', secondsRemaining.toLocaleString());
             }
-        } else {
-            console.log('Token is still valid');
         }
         
         return {

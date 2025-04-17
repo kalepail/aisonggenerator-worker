@@ -18,7 +18,7 @@ app
     //     const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
     //     const stub = env.DURABLE_OBJECT.get(doid);
 
-    //     const { error } = await stub.getTokens();
+    //     const { error } = await stub.getTokens(true);
 
     //     if (error) {
     //         throw new HTTPException(400, { res: ctx.json(error, 400) });
@@ -43,7 +43,7 @@ export default {
         const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
         const stub = env.DURABLE_OBJECT.get(doid);
 
-        const { error } = await stub.getTokens();
+        const { error } = await stub.getTokens(true);
 
         if (error) {
             console.error(error)

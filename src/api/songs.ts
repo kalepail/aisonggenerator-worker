@@ -1,11 +1,7 @@
 import { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
-// import { fetcher } from "itty-fetcher";
 
-// const supabase = fetcher({ base: 'https://hjgeamyjogwwmvjydbfm.supabase.co' });
-// const aisonggenerator = fetcher({ base: 'https://aisonggenerator.io' });
-
-export async function getSongs(ctx: Context) {
+export async function getSongs(ctx: Context<{ Bindings: Env }>) {
     const { req, env } = ctx
     const ids = req.query('ids')?.split(',');
 
@@ -34,7 +30,7 @@ export async function getSongs(ctx: Context) {
     return ctx.json(res);
 }
 
-export async function postSongs(ctx: Context) {
+export async function postSongs(ctx: Context<{ Bindings: Env }>) {
     const { req, env } = ctx
     const data: LyricsResponse = await req.json()
     const body = {
