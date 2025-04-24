@@ -13,19 +13,6 @@ app
     .post('/api/lyrics', lyrics)
     .post('/api/songs', postSongs)
     .get('/api/songs', getSongs)
-    // .get('/api/token', async (ctx) => {
-    //     const { env } = ctx 
-    //     const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
-    //     const stub = env.DURABLE_OBJECT.get(doid);
-
-    //     const { error } = await stub.getTokens(true);
-
-    //     if (error) {
-    //         throw new HTTPException(400, { res: ctx.json(error, 400) });
-    //     }
-
-    //     return ctx.body(null, 204);
-    // })
     .onError((err, ctx) => {
         console.error(err)
 

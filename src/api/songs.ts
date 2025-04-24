@@ -33,15 +33,50 @@ export async function getSongs(ctx: Context<{ Bindings: Env }>) {
 export async function postSongs(ctx: Context<{ Bindings: Env }>) {
     const { req, env } = ctx
     const data: LyricsResponse = await req.json()
+
+    // {
+    //     "lyrics_mode": false,
+    //     "instrumental": true,
+    //     "lyrics": "",
+    //     "description": "\"A neon dreamscape awakens, pulsating synths swirling like restless spirits, a driving beat unfurls like a promise, carrying you through the velvety darkness of a moonlit, urban oasis\"",
+    //     "title": "",
+    //     "styles": "",
+    //     "style_negative": "",
+    //     "type": "desc",
+    //     "model": "v1.0",
+    //     "user_id": "",
+    //     "user_email": "",
+    //     "is_private": false
+    // }
+
+    // {
+    //     "lyrics_mode": true,
+    //     "instrumental": true,
+    //     "lyrics": "Verse 1:\n\nCruising down the skyline, lights begin to fade,\nThe neon dreams are fading, but my heart’s not afraid.\nThe city’s hum is distant, but it calls me like the night,\nI'm chasing all the echoes of a neon city light.\n\nChorus:\n\nOn the skyline drive, I feel the rhythm alive,\nWith every beat of the drums, I’m drifting through the sky.\nThe stars are dancing on the edge of time,\nLost in the glow, I’m feeling so divine.\n\nVerse 2:\n\nThe city’s pulse is fading, but it’s etched into my mind,\nThese roads will take me places that I’ll never leave behind.\nThe synths are calling softly, like a breeze through the trees,\nI’m floating in the dreamscape where the world feels so free.\n\nChorus:\n\nOn the skyline drive, I feel the rhythm alive,\nWith every beat of the drums, I’m drifting through the sky.\nThe stars are dancing on the edge of time,\nLost in the glow, I’m feeling so divine.\n\nBridge:\n\nEvery turn, every curve, brings me closer to the sky,\nThe dream is never ending, as the city passes by.\nWith dreamy drums and synths so high,\nI’m forever lost in this skyline ride.\n\nOutro:\n\nSo let the skyline drive me, where the stars collide,\nIn the light of the future, I’m forever gonna ride.",
+    //     "description": "",
+    //     "title": "Skyline Drive",
+    //     "styles": "Synthwave, Dreamy, Electronic",
+    //     "style_negative": "",
+    //     "type": "lyrics",
+    //     "model": "v1.0",
+    //     "user_id": "",
+    //     "user_email": "",
+    //     "is_private": false
+    // }
+
     const body = {
         lyrics_mode: true,
-        instrumental: false,
+        instrumental: data.instrumental === true ? true : false,
         lyrics: data.lyrics,
+        // description: "",
         title: data.title,
         styles: data.style.join(', '),
+        // style_negative: "",
         type: "lyrics",
+        model: "v1.0", // "v2.0"
         user_id: env.AISONGGENERATOR_USER_ID,
-        is_private: false
+        // user_email: "",
+        is_private: data.public === false ? true : false,
     }
 
     const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
