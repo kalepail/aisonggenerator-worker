@@ -3,6 +3,7 @@ import { getSongs, postSongs } from './api/songs';
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { HTTPException } from 'hono/http-exception'
+import { getClerkToken } from './api/suno';
 
 export { DO } from "./do";
 
@@ -29,6 +30,12 @@ export default {
     async scheduled(ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
         const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
         const stub = env.DURABLE_OBJECT.get(doid);
+
+        try {
+            await getClerkToken();
+        } catch (error) {
+            console.error('SUNO ERROR', error);
+        }
 
         const { error } = await stub.getTokens(true);
 

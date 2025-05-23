@@ -20,7 +20,7 @@ export interface LyricsStatusResponse {
     tags: string[] | null;
 }
 
-async function getClerkToken(): Promise<string> {
+export async function getClerkToken(): Promise<string> {
     const response = await fetch(CLERK_TOKEN_URL, {
         method: 'POST',
         headers: {
