@@ -11,8 +11,94 @@ interface UnifiedLyricsResponse {
     service: string;
 }
 
-// TODO use this if the below fails https://aisonggenerator.io/api/lyrics-generate
-// Consider using the suno lyrics generator
+// Service definition for cleaner iteration
+interface LyricsService {
+    name: string;
+    fetch: (prompt: string, requestBody: string, env: Env) => Promise<UnifiedLyricsResponse | null>;
+}
+
+const lyricsServices: LyricsService[] = [
+    {
+        name: "aisonggenerator.io",
+        fetch: async (prompt, _requestBody, env) => {
+            const res = await fetch('https://aisonggenerator.io/api/lyrics-generate', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    prompt,
+                    model: "openai/gpt-5.2-chat",
+                    userId: env.AISONGGENERATOR_USER_ID,
+                }),
+            });
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+            }
+            const response: any = await res.json();
+            if (response?.lyrics && response?.title) {
+                return {
+                    title: response.title,
+                    service: "aisonggenerator.io",
+                    lyrics: response.lyrics,
+                    style: response.tags ? response.tags.split(',').map((s: string) => s.trim()) : (response.style ? response.style.split(',').map((s: string) => s.trim()) : []),
+                };
+            }
+            throw new Error("Response missing lyrics or title");
+        }
+    },
+    {
+        name: "suno",
+        fetch: async (prompt) => {
+            const sunoResponse: LyricsStatusResponse = await getSunoLyrics(prompt);
+            if (sunoResponse.status === 'complete' && sunoResponse.text && sunoResponse.title) {
+                return {
+                    title: sunoResponse.title,
+                    service: "suno",
+                    lyrics: sunoResponse.text,
+                    style: sunoResponse.tags || [],
+                };
+            }
+            throw new Error(`Suno status: ${sunoResponse.status}, error: ${sunoResponse.error_message || 'no lyrics/title'}`);
+        }
+    },
+    {
+        name: "cloudflare-ai",
+        fetch: async (prompt, _requestBody, env) => {
+            const cfApiResponse = await songWrite(env, prompt || "");
+            if (!cfApiResponse || typeof (cfApiResponse as any).response !== 'string') {
+                throw new Error("Cloudflare AI returned invalid response type");
+            }
+            const cfAiOutput = cfApiResponse as { response: string };
+            let parsedCfResponse: any;
+            try {
+                parsedCfResponse = JSON.parse(
+                    cfAiOutput.response.replace(
+                        /"lyrics":\s*"(.*?)"(?=,|"style")/s,
+                        (_, lyrics) => {
+                            const escaped = lyrics
+                                .replace(/\\/g, '\\\\')
+                                .replace(/"/g, '\\"')
+                                .replace(/\r?\n/g, '\\n');
+                            return `"lyrics": "${escaped}"`;
+                        }
+                    )
+                );
+            } catch (parseErr) {
+                throw new Error(`Failed to parse Cloudflare AI response: ${cfAiOutput.response.substring(0, 200)}`);
+            }
+            if (parsedCfResponse.title && parsedCfResponse.lyrics && Array.isArray(parsedCfResponse.style)) {
+                return {
+                    title: parsedCfResponse.title.trim(),
+                    service: "cloudflare-ai",
+                    lyrics: parsedCfResponse.lyrics.trim(),
+                    style: parsedCfResponse.style,
+                };
+            }
+            throw new Error("Cloudflare AI response missing title, lyrics, or style array");
+        }
+    }
+];
 
 export async function lyrics(ctx: Context<{ Bindings: Env }>) {
     const { req } = ctx;
@@ -27,109 +113,25 @@ export async function lyrics(ctx: Context<{ Bindings: Env }>) {
         prompt = requestBody;
     }
 
-    // Attempt 1: https://lyrics-generator.tommy-ni1997.workers.dev
-    try {
-        const response: any = await fetch('https://lyrics-generator.tommy-ni1997.workers.dev', {
-            method: 'POST',
-            body: requestBody, // Pass the original request body
-        }).then(async (res: any) => {
-            if (res.ok) {
-                return res.json();
+    const errors: string[] = [];
+
+    for (const service of lyricsServices) {
+        try {
+            console.log(`Attempting lyrics generation with ${service.name}...`);
+            const result = await service.fetch(prompt || "", requestBody, ctx.env);
+            if (result) {
+                console.log(`Successfully generated lyrics with ${service.name}`);
+                return ctx.json(result);
             }
-            // Don't throw HTTPException here, just let it be caught to try the next service
-            throw new Error(`tommy-ni1997 failed: ${res.status}`);
-        });
-
-        if (response && response.lyrics && response.title) {
-            return ctx.json({
-                title: response.title,
-                service: "tommy-ni1997",
-                lyrics: response.lyrics,
-                style: response.style ? response.style.split(',').map((s: string) => s.trim()) : [],
-            } as UnifiedLyricsResponse);
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            console.warn(`${service.name} failed: ${errorMsg}`);
+            errors.push(`${service.name}: ${errorMsg}`);
+            // Continue to next service
         }
-    } catch (error) {
-        console.warn("Failed to fetch from tommy-ni1997, trying next service:", error);
     }
 
-    // TODO consider dropping this service as it feels fragile. Rate limits, hard coded session id, etc.
-    // Attempt 2: Suno getLyrics
-    try {
-        const sunoResponse: LyricsStatusResponse = await getSunoLyrics(prompt); // Pass the prompt to Suno
-        if (sunoResponse.status === 'complete' && sunoResponse.text && sunoResponse.title) {
-            return ctx.json({
-                title: sunoResponse.title,
-                service: "suno",
-                lyrics: sunoResponse.text,
-                style: sunoResponse.tags || [],
-            } as UnifiedLyricsResponse);
-        }
-    } catch (error) {
-        console.warn("Failed to fetch from Suno API, trying next service:", error);
-    }
-
-    // Attempt 3: https://aisonggenerator.io/api/lyrics-generate
-    try {
-        const response: any = await fetch('https://aisonggenerator.io/api/lyrics-generate', {
-            method: 'POST',
-            body: requestBody, // Pass the original request body
-        })
-            .then(async (res: any) => {
-                if (res.ok) {
-                    return res.json();
-                }
-                // Don't throw HTTPException here, just let it be caught to try the next service
-                throw new Error(`aisonggenerator.io failed: ${res.status}`);
-            });
-
-        if (response && response.lyrics && response.title) {
-            return ctx.json({
-                title: response.title,
-                service: "aisonggenerator.io",
-                lyrics: response.lyrics,
-                style: response.tags ? response.tags.split(',').map((s: string) => s.trim()) : (response.style ? response.style.split(',').map((s: string) => s.trim()) : []),
-            } as UnifiedLyricsResponse);
-        }
-    } catch (error) {
-        console.warn("Failed to fetch from aisonggenerator.io, trying next service (Cloudflare AI):", error);
-    }
-
-    // Attempt 4: Cloudflare AI songWrite
-    try {
-        const cfApiResponse = await songWrite(ctx.env, prompt || "");
-
-        // Check if cfApiResponse is not a stream and has the 'response' property as a string
-        if (cfApiResponse && typeof (cfApiResponse as any).response === 'string') {
-            const cfAiOutput = cfApiResponse as { response: string }; // Type assertion
-            const parsedCfResponse = JSON.parse(
-                cfAiOutput.response.replace(
-                    /"lyrics":\s*"(.*?)"(?=,|"style")/s,
-                    (_, lyrics) => {
-                        const escaped = lyrics
-                            .replace(/\\/g, '\\\\')      // Escape backslashes
-                            .replace(/"/g, '\\"')        // Escape double quotes
-                            .replace(/\r?\n/g, '\\n');   // Escape newlines
-                        return `"lyrics": "${escaped}"`;
-                    }
-                )
-            );
-            if (parsedCfResponse.title && parsedCfResponse.lyrics && Array.isArray(parsedCfResponse.style)) {
-                return ctx.json({
-                    title: parsedCfResponse.title.trim(),
-                    service: "cloudflare-ai",
-                    lyrics: parsedCfResponse.lyrics.trim(),
-                    style: parsedCfResponse.style,
-                } as UnifiedLyricsResponse);
-            }
-        }
-        // If CF AI response is invalid, not the expected object, or structure is not as expected, it will fall through
-    } catch (error) {
-        console.warn("Failed to generate lyrics using Cloudflare AI:", error);
-        // This is now the last attempt, so if it fails, throw the final HTTPException
-        throw new HTTPException(500, { message: "All lyric generation services failed.", cause: error });
-    }
-
-    // If all attempts fail and no specific error was thrown by the last service that we want to propagate,
-    // or the last service returned an invalid response structure.
-    throw new HTTPException(500, { message: "All lyric generation services failed or returned an invalid response." });
+    // All services failed
+    console.error("All lyrics services failed:", errors);
+    throw new HTTPException(500, { message: `All lyric generation services failed. Errors: ${errors.join('; ')}` });
 }

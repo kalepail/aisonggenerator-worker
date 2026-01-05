@@ -26,6 +26,23 @@ interface AiSongGeneratorApiResponse {
     // Potentially other fields based on actual API responses
 }
 
+// Interface for the getStatus endpoint response
+// Note: This endpoint returns progressive updates - audio can be null, empty string, or a URL
+// as the song generation progresses through different status values (1, 2, 4, etc.)
+interface GetStatusResponse {
+    success: boolean;
+    data?: {
+        music_id: string;
+        status: number;
+        audio: string | null; // Can be null, empty string "", or URL during progressive generation
+        identify_id?: string;
+        [key: string]: any; // Allow other fields we don't need
+    };
+}
+
+// Type for the data returned from getStatus endpoint
+type GetStatusData = NonNullable<GetStatusResponse['data']>;
+
 
 /**
  * Generates a song using the aisonggenerator.io service.
@@ -45,7 +62,7 @@ export async function generateAiSongGeneratorSong(
         title: params.title,
         styles: params.styles.join(', '),
         type: "lyrics",
-        model: "v1.0", // "v2.0"
+        model: "v3.0",
         user_id: env.AISONGGENERATOR_USER_ID,
         is_private: !params.isPublic, // Invert isPublic for is_private
     };
@@ -61,13 +78,20 @@ export async function generateAiSongGeneratorSong(
 
     const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
     const stub = env.DURABLE_OBJECT.get(doid);
-    const { access_token, refresh_token } = await stub.getTokens();
+    const { access_token, refresh_token, expires_at } = await stub.getTokens();
 
     const response = await fetch(`https://aisonggenerator.io/api/song`, {
         method: 'POST',
         headers: {
             // Ensure Cookie format is exactly as expected by the server
-            Cookie: `sb-hjgeamyjogwwmvjydbfm-auth-token=${encodeURIComponent(JSON.stringify([access_token, refresh_token, null, null, null]))}`,
+            // Cookie: `sb-hjgeamyjogwwmvjydbfm-auth-token=${encodeURIComponent(JSON.stringify([access_token, refresh_token, null, null, null]))}`,
+            Cookie: `sb-hjgeamyjogwwmvjydbfm-auth-token.0=base64-${btoa(JSON.stringify({
+                access_token,
+                token_type: "bearer",
+                expires_in: 3600,
+                expires_at,
+                refresh_token
+            }))};`,
             'Content-Type': 'application/json',
         },
         body: JSON.stringify(body)
@@ -88,8 +112,12 @@ export async function generateAiSongGeneratorSong(
     } else if (resJson.data && (resJson.data as any).length !== undefined && (resJson.data as any).length > 0) { 
         // Case 3: res.data with length > 0 (covers data being a non-empty array or non-empty string/number)
         if (Array.isArray(resJson.data)) {
-            // Ensure all items are strings or numbers before returning
-            if (resJson.data.every(item => typeof item === 'string' || typeof item === 'number')) {
+            // Check if all items have music_id property (Case 3a: array of objects with music_id)
+            if (resJson.data.every((item: any) => item?.music_id !== undefined && item?.music_id !== null)) {
+                return resJson.data.map((item: any) => String(item.music_id)); // Extract and convert music_id to string
+            }
+            // Check if all items are strings or numbers (Case 3b: array of strings/numbers)
+            else if (resJson.data.every(item => typeof item === 'string' || typeof item === 'number')) {
                 return resJson.data.map(item => String(item)); // Convert all to string
             }
         } else if (typeof resJson.data === 'string' || typeof resJson.data === 'number') {
@@ -120,36 +148,47 @@ export async function getAiSongGeneratorSongResults(
         return [];
     }
 
-    // Prioritize userIdArg, then env.AISONGGENERATOR_USER_ID.
-    // Since AISONGGENERATOR_USER_ID is non-optional in Env, it will always be available as a fallback.
-    const currentUserId = userIdArg || env.AISONGGENERATOR_USER_ID;
+    // Make parallel requests to the getStatus endpoint for each taskId
+    const responses = await Promise.all(
+        taskIds.map(async (id) => {
+            const response = await fetch(
+                `https://aisonggenerator.io/api/musicLibrary/getStatus?musicId=${id}`,
+                {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                }
+            );
 
-    let filters = "";
-    for (let id of taskIds) {
-        filters += `identify_id.eq."${id}",`;
-    }
-    filters = filters.slice(0, -1); // Remove trailing comma
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error(`Failed to get status for musicId ${id}:`, errorText);
+                // Return null for failed requests instead of throwing to allow other requests to complete
+                return null;
+            }
 
-    // Added identify_id to the select query to potentially map results back if needed
-    const supabaseUrl = `https://hjgeamyjogwwmvjydbfm.supabase.co/rest/v1/music?select=music_id,status,audio,identify_id&user_id=eq.${currentUserId}&or=(${filters})`;
+            const json: GetStatusResponse = await response.json();
+            // Check if response has success: true and data
+            if (json.success && json.data) {
+                return json.data;
+            }
+            return null;
+        })
+    );
 
-    const response = await fetch(supabaseUrl, {
-        method: 'GET',
-        headers: {
-            'apikey': env.AISONGGENERATOR_API_KEY,
-            'Accept': 'application/json' // Good practice to include Accept header
-        }
-    });
+    // Filter out null responses and transform to AiSongGeneratorSong format
+    // Note: audio can be null or empty string during progressive generation - normalize to null
+    const results: AiSongGeneratorSong[] = responses
+        .filter((data): data is GetStatusData => data !== null)
+        .map((data) => ({
+            music_id: data.music_id,
+            status: data.status,
+            // Handle progressive generation: null, empty string "", or URL - normalize empty/null to null
+            audio: (data.audio && typeof data.audio === 'string' && data.audio.trim() !== '') ? data.audio : null,
+            identify_id: data.identify_id,
+            service: 'aisonggenerator' as const
+        }));
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error("Supabase API error:", errorText);
-        throw new Error(`Failed to get songs from Supabase: ${response.status} ${errorText}`);
-    }
-
-    const results: AiSongGeneratorSong[] = await response.json();
-    return results.map(song => ({
-        ...song,
-        service: 'aisonggenerator' as const
-    }));
+    return results;
 } 

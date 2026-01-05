@@ -84,7 +84,7 @@ export class DO extends DurableObject<Env> {
             ) {
                 try {
                     this.refreshingAisgToken = true;
-                    await this.refreshToken(); // Renamed from refreshToken
+                    await this.refreshToken();
                     console.log('AISG Token refreshed');
                 } catch (err) {
                     return { error: err };
