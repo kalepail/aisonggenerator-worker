@@ -1,12 +1,12 @@
 import { getCaptchaToken } from "./2captcha";
 
 // Constants
-const DIFFRHYTHM_GENERATE_URL = "https://diffrhythm.ai/api/generate/handleNewV2";
-const DIFFRHYTHM_GET_WORKS_URL = "https://diffrhythm.ai/api/works/updateMusicListByIds";
+const DIFFRHYTHM_GENERATE_URL = "https://diffrhythm.ai/api/generate/v1/music/create";
+const DIFFRHYTHM_GET_WORKS_URL = "https://diffrhythm.ai/api/materials/music/getMusicsByIds";
 
 // Default values from example; consider making these configurable or passed as arguments
 const DEFAULT_USER_ID = "d4ba8feabe034d0c84f0b2f6210ff633";
-const DEFAULT_FINGERPRINT = "a48dab0cfca1490b1c6b26af22919677";
+const DEFAULT_FINGERPRINT = "e61b80a2fa74c435f4d3922f6a5e3673";
 
 // --- Interfaces ---
 
@@ -22,51 +22,72 @@ export interface DiffRhythmGenerateParams {
     fingerprint?: string;
 }
 
-// Request body for Diffrhythm's handleNewV2 endpoint
+// Request body for Diffrhythm's v1/music/create/ endpoint
 interface DiffRhythmGenerateRequestBody {
     custom_mode: boolean;
     instrumental: boolean;
-    input_description: string;
-    input_text: string;
+    model: string;
+    is_public: boolean;
     input_title: string;
     input_tags: string;
+    input_text: string;
     user_id: string;
-    is_public: boolean;
-    cf_token: string;
     fingerprint: string;
+    generator: string;
 }
 
-// Response from Diffrhythm's handleNewV2 endpoint
+// Response from Diffrhythm's v1/music/create endpoint
 interface DiffRhythmGenerateResponse {
-    uid?: string;
-    error?: any; // Define more specific error type if known
-    message?: string; // Often present on error
+    code: number;
+    message: string;
+    data?: Array<{
+        code: number;
+        message: string;
+        data: {
+            batch_uid: string;
+            uid: string;
+            task_id: string;
+        };
+    }>;
+    error?: any;
 }
 
-// Request body for Diffrhythm's updateMusicListByIds endpoint
+// Request body for Diffrhythm's getMusicsByIds endpoint
 interface DiffRhythmGetWorksRequestBody {
     uids: string[];
     user_id: string;
-    current_page?: number; // Defaults to 1 if not provided
+    current_page: number;
 }
 
-// Individual work item from Diffrhythm's updateMusicListByIds response
+// Individual work item from Diffrhythm's getMusicsByIds response
 interface DiffRhythmWork {
-    id: string;
     uid: string;
-    input_title: string;
-    output_audio_url?: string[] | null; // Array of audio URLs
-    output_image_url?: string[] | null;
-    status: number; // 0 for completed in example
-    // ... other fields from the example if needed
+    audio_url: string | null;
+    batch_uid: string;
+    created_at: string;
+    fingerprint: string | null;
+    generator: string;
+    input_data: {
+        model: string;
+        style: string;
+        title: string;
+        prompt: string;
+        customMode: boolean;
+        instrumental: boolean;
+    };
+    result_data: {
+        model: string;
+        duration?: number; // Only present when complete
+    };
+    status: number; // 0 = processing, 1 = success
+    user_id: string;
+    works_name: string | null;
+    works_type: string;
+    source: string;
 }
 
-// Response from Diffrhythm's updateMusicListByIds endpoint
-interface DiffRhythmGetWorksResponse {
-    status: number; // Overall status, 0 for success
-    data?: DiffRhythmWork[] | null;
-    error?: any; // Define more specific error type if known
-}
+// Response from Diffrhythm's getMusicsByIds endpoint is an array directly
+type DiffRhythmGetWorksResponse = DiffRhythmWork[];
 
 // Desired output format for getDiffRhythmSongResults
 export interface TransformedSong {
@@ -95,7 +116,7 @@ function extractMusicIdFromUrl(url: string): string {
 /**
  * Generates a song (lyrical or instrumental) using the Diffrhythm API.
  */
-export async function generateDiffRhythmSong(params: DiffRhythmGenerateParams, env: Env): Promise<string> {
+export async function generateDiffRhythmSong(params: DiffRhythmGenerateParams, env: Env): Promise<string[]> {
     const cfToken = await getCaptchaToken();
     const userId = params.userId || DEFAULT_USER_ID;
     const fingerprint = params.fingerprint || DEFAULT_FINGERPRINT;
@@ -104,40 +125,24 @@ export async function generateDiffRhythmSong(params: DiffRhythmGenerateParams, e
     const stub = env.DURABLE_OBJECT.get(doid);
     const sessionToken = await stub.getDiffrhythmSession();
 
-    let requestBody: DiffRhythmGenerateRequestBody;
-
-    if (params.instrumental) {
-        requestBody = {
-            custom_mode: true,
-            instrumental: true,
-            input_description: "",
-            input_text: params.description || "",
-            input_title: params.title,
-            input_tags: params.tags,
-            user_id: userId,
-            is_public: params.isPublic === undefined ? false : params.isPublic,
-            cf_token: cfToken,
-            fingerprint: fingerprint,
-        };
-    } else {
-        requestBody = {
-            custom_mode: true,
-            instrumental: false,
-            input_description: "",
-            input_text: params.lyrics || "",
-            input_title: params.title,
-            input_tags: params.tags,
-            user_id: userId,
-            is_public: params.isPublic === undefined ? false : params.isPublic,
-            cf_token: cfToken,
-            fingerprint: fingerprint,
-        };
-    }
+    const requestBody: DiffRhythmGenerateRequestBody = {
+        custom_mode: true,
+        instrumental: params.instrumental,
+        model: "V4",
+        is_public: params.isPublic === undefined ? false : params.isPublic,
+        input_title: params.title,
+        input_tags: params.tags,
+        input_text: params.instrumental ? (params.description || "") : (params.lyrics || ""),
+        user_id: userId,
+        fingerprint: fingerprint,
+        generator: "music",
+    };
 
     const response = await fetch(DIFFRHYTHM_GENERATE_URL, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
+            "cf-client-token": cfToken,
             ...(typeof sessionToken === 'string' && sessionToken ? { "Cookie": sessionToken } : {}),
         },
         body: JSON.stringify(requestBody),
@@ -151,12 +156,21 @@ export async function generateDiffRhythmSong(params: DiffRhythmGenerateParams, e
 
     const result: DiffRhythmGenerateResponse = await response.json();
 
-    if (result.error || !result.uid) {
-        console.error("Diffrhythm generate API returned an error or no UID:", result);
+    if (result.code !== 200 || !result.data || result.data.length === 0) {
+        console.error("Diffrhythm generate API returned an error or no data:", result);
         throw new Error(`Diffrhythm API error: ${result.message || JSON.stringify(result.error) || 'Unknown error during generation'}`);
     }
 
-    return result.uid;
+    // Extract all UIDs from the batch response
+    const uids = result.data
+        .filter(item => item.code === 200 && item.data?.uid)
+        .map(item => item.data.uid);
+
+    if (uids.length === 0) {
+        throw new Error(`Diffrhythm API error: No successful songs in batch`);
+    }
+
+    return uids;
 }
 
 /**
@@ -197,45 +211,44 @@ export async function getDiffRhythmSongResults(uids: string[], env: Env, userId?
 
     const result: DiffRhythmGetWorksResponse = await response.json();
 
-    if (result.status !== 0 || !result.data) {
-        // Diffrhythm API's own status field indicates an issue, or data is missing
-        console.error("Diffrhythm get works API returned an error status or no data:", result);
-        if (result.data === null && result.status === 0) { // API might return empty data legitimately
-            return [];
-        }
-        throw new Error(`Diffrhythm API error when fetching works: ${JSON.stringify(result.error) || 'Non-zero status or missing data'}`);
+    if (!result || !Array.isArray(result)) {
+        console.error("Diffrhythm get works API returned unexpected response:", result);
+        return [];
     }
 
     const transformedSongs: TransformedSong[] = [];
 
-    // TODO I've seen an instance (637486bbf7294cfcbc378444ba63cb3f) where the data[work.status] was 9 due to the name Taylor 
-    // might be able to capture that and throw early and pass a status -1 here
-    // `0` I think is in process, `1` is success and likely anything above that is some type of error
+    // status 0 = in process, 1 = success, anything else (e.g., 9) is likely an error
 
-    for (const work of result.data) {
-        if (work.output_audio_url && work.output_audio_url.length > 0) {
-            for (const audioUrl of work.output_audio_url) {
-                if (audioUrl) { // Ensure URL is not null or empty
-                    const musicId = extractMusicIdFromUrl(audioUrl);
-                    if (musicId) { // Only add if music_id could be extracted
-                        transformedSongs.push({
-                            music_id: musicId,
-                            status: 4, // Status 4 if audio URL exists
-                            audio: audioUrl,
-                            service: 'diffrhythm' as const, // Added service field
-                        });
-                    }
-                }
+    for (const work of result) {
+        if (work.audio_url) {
+            const musicId = extractMusicIdFromUrl(work.audio_url);
+            if (musicId) {
+                transformedSongs.push({
+                    music_id: musicId,
+                    status: 4, // Status 4 if audio URL exists
+                    audio: work.audio_url,
+                    service: 'diffrhythm' as const,
+                });
             }
+        } else if (work.status === 0) {
+            // Still processing
+            transformedSongs.push({
+                music_id: work.uid,
+                status: 0,
+                audio: null,
+                service: 'diffrhythm' as const,
+            });
+        } else if (work.status > 1) {
+            // Error status (e.g., 9 for content policy violation)
+            transformedSongs.push({
+                music_id: work.uid,
+                status: -1,
+                audio: null,
+                service: 'diffrhythm' as const,
+            });
         }
-        // If output_audio_url is empty or null for a work, it contributes no entries, per requirement.
     }
-
-    // "if `output_audio_url` is empty just return an empty array."
-    // This condition seems to apply if *all* works result in no audio URLs,
-    // or if the initial uids list was for works that don't produce output_audio_urls.
-    // The current loop structure handles this naturally: if no valid audio URLs are found
-    // across all processed UIDs, transformedSongs will remain empty.
 
     return transformedSongs;
 }

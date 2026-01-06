@@ -73,7 +73,6 @@ export async function postSongs(ctx: Context<{ Bindings: Env }>) {
     const source = req.query('source') || 'aisonggenerator'; // Default to aisonggenerator
 
     let taskIds: string[] = []; // For aisonggenerator
-    let uid: string = ""; // For diffrhythm
 
     // Prepare combined description for instrumental songs
     let instrumentalDesc = data.prompt || "";
@@ -103,8 +102,8 @@ export async function postSongs(ctx: Context<{ Bindings: Env }>) {
                 description: data.instrumental ? instrumentalDesc : data.lyrics, // Use combinedDesc for instrumental description
                 isPublic: data.public,
             };
-            uid = await generateDiffRhythmSong(params, env);
-            return ctx.json([uid]); // diffrhythm returns a single uid
+            const uids = await generateDiffRhythmSong(params, env);
+            return ctx.json(uids); // diffrhythm now returns array of uids
 
         } else {
             return ctx.json({ error: "Invalid 'source'. Must be 'aisonggenerator' or 'diffrhythm'." }, 400);
