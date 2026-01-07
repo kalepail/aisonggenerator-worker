@@ -97,20 +97,6 @@ export interface TransformedSong {
     service: 'diffrhythm'; // Added service field
 }
 
-// --- Helper Functions ---
-
-function extractMusicIdFromUrl(url: string): string {
-    try {
-        const parsedUrl = new URL(url);
-        const pathParts = parsedUrl.pathname.split('/');
-        const fileName = pathParts[pathParts.length - 1];
-        return fileName.split('.')[0]; // Remove extension
-    } catch (e) {
-        console.warn(`Could not parse URL or extract music_id from: ${url}`);
-        return ""; // Or handle error as appropriate
-    }
-}
-
 // --- Exported API Functions ---
 
 /**
@@ -222,15 +208,15 @@ export async function getDiffRhythmSongResults(uids: string[], env: Env, userId?
 
     for (const work of result) {
         if (work.audio_url) {
-            const musicId = extractMusicIdFromUrl(work.audio_url);
-            if (musicId) {
-                transformedSongs.push({
-                    music_id: musicId,
-                    status: 4, // Status 4 if audio URL exists
-                    audio: work.audio_url,
-                    service: 'diffrhythm' as const,
-                });
-            }
+            // Always use work.uid as music_id for consistency - it's stable across the entire lifecycle
+            // The audio filename extracted from URL was previously used here but caused ID changes
+            // between polling calls (uid during processing → filename after completion)
+            transformedSongs.push({
+                music_id: work.uid,
+                status: 4, // Status 4 if audio URL exists
+                audio: work.audio_url,
+                service: 'diffrhythm' as const,
+            });
         } else if (work.status === 0) {
             // Still processing
             transformedSongs.push({
