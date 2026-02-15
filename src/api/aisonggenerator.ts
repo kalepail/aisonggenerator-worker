@@ -152,7 +152,7 @@ export async function getAiSongGeneratorSongResults(
     const responses = await Promise.all(
         taskIds.map(async (id) => {
             const response = await fetch(
-                `https://aisonggenerator.io/api/musicLibrary/getStatus?musicId=${id}`,
+                `https://aisonggenerator.io/api/music-library/get-status?musicId=${id}`,
                 {
                     method: 'GET',
                     headers: {
