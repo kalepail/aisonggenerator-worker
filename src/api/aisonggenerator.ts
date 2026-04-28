@@ -62,7 +62,7 @@ export async function generateAiSongGeneratorSong(
         title: params.title,
         styles: params.styles.join(', '),
         type: "lyrics",
-        model: "v3.0",
+        model: "v4.0",
         user_id: env.AISONGGENERATOR_USER_ID,
         is_private: !params.isPublic, // Invert isPublic for is_private
     };
