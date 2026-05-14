@@ -192,8 +192,16 @@ export async function getAiSongGeneratorSongResults(
                 identify_id: data.identify_id,
                 service: 'aisonggenerator' as const
             });
+        } else {
+            results.push({
+                music_id: String(taskIds[i]),
+                status: 0,
+                audio: null,
+                identify_id: String(taskIds[i]),
+                service: 'aisonggenerator' as const
+            });
         }
     }
 
     return results;
-} 
+}
