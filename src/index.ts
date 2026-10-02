@@ -44,7 +44,7 @@ export default {
             console.error("Error or Exception during AISG session check in scheduled task:", e.message);
         }
 
-        // Refresh Diffrhythm session token
+        // Extend the aisinging.ai session cookie.
         try {
             await stub.getDiffrhythmSession(true);
         } catch (e: any) {
