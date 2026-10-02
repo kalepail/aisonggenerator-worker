@@ -2,6 +2,7 @@ import { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { getLyrics as getSunoLyrics, LyricsStatusResponse } from "./suno"; // Import Suno functions
 import { songWrite } from "./cf"; // Import songWrite
+import { aisgAuthHeaders } from "./aisonggenerator";
 
 // Define the unified response type
 interface UnifiedLyricsResponse {
@@ -21,30 +22,32 @@ const lyricsServices: LyricsService[] = [
     {
         name: "aisonggenerator.io",
         fetch: async (prompt, _requestBody, env) => {
-            const res = await fetch('https://aisonggenerator.io/api/features/lyrics-generate', {
+            const res = await fetch('https://aisonggenerator.io/api/music/lyrics/generate', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: aisgAuthHeaders(env, true),
                 body: JSON.stringify({
+                    action: 'generate',
+                    model: 'openrouter/auto',
                     prompt,
-                    model: "openai/gpt-5.2-chat",
-                    userId: env.AISONGGENERATOR_USER_ID,
                 }),
             });
+            const response: any = await res.json().catch(() => null);
             if (!res.ok) {
-                throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+                throw new Error(`HTTP ${res.status}: ${response?.error || ''}`.trim());
             }
-            const response: any = await res.json();
-            if (response?.lyrics && response?.title) {
+            const tagText = typeof response?.tags === 'string'
+                ? response.tags
+                : (typeof response?.style === 'string' ? response.style : '');
+            const style = tagText.split(',').map((item: string) => item.trim()).filter(Boolean);
+            if (response?.lyrics && response?.title && style.length > 0) {
                 return {
                     title: response.title,
                     service: "aisonggenerator.io",
                     lyrics: response.lyrics,
-                    style: response.tags ? response.tags.split(',').map((s: string) => s.trim()) : (response.style ? response.style.split(',').map((s: string) => s.trim()) : []),
+                    style,
                 };
             }
-            throw new Error("Response missing lyrics or title");
+            throw new Error("Response missing lyrics, title, or tags");
         }
     },
     {

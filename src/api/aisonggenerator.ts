@@ -1,4 +1,4 @@
-// Interface for the parameters to generate a song
+// Parameters for one song generation request.
 export interface AiSongGeneratorGenerateParams {
     title: string;
     styles: string[]; // e.g., ["Synthwave", "Dreamy", "Electronic"]
@@ -8,200 +8,265 @@ export interface AiSongGeneratorGenerateParams {
     isPublic: boolean; // True if public, false if private
 }
 
-// Interface for the structure of a song result from aisonggenerator/Supabase
+// Song row returned to smol-workflow.
+// status is numeric so the workflow poller can keep its existing checks:
+// < 0 failed, < 4 still generating, >= 4 complete.
 export interface AiSongGeneratorSong {
-    music_id: string; // This is the actual music_id from Supabase
+    music_id: string;
     status: number;
     audio: string | null;
-    service: 'aisonggenerator'; // Added service field
-    // Include other fields if needed, like identify_id if you want to map back to task_id
-    identify_id?: string; // The task_id used for generation
+    service: 'aisonggenerator';
+    identify_id?: string; // Provider task id for this generation
 }
 
-// More specific type for the aisonggenerator.io response
-interface AiSongGeneratorApiResponse {
-    task_id?: string | number; // Allow number
-    data?: { taskId?: string | number; [index: number]: string | number; } | (string | number)[] | string | number; // Allow number and (string | number)[]
-    jobs?: { id: string | number }[]; // Allow number for id
-    // Potentially other fields based on actual API responses
-}
+// Site default in the create page. The label in the UI is "V4". The API value is "v6".
+const MUSIC_MODEL = 'v6';
+const EASY_PROMPT_LIMIT = 3000;
+const STYLE_LIMIT = 1000;
+const ORIGIN = 'https://aisonggenerator.io';
+const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// Interface for the getStatus endpoint response
-// Note: This endpoint returns progressive updates - audio can be null, empty string, or a URL
-// as the song generation progresses through different status values (1, 2, 4, etc.)
-interface GetStatusResponse {
-    success: boolean;
+interface SubmitResponse {
+    success?: boolean;
+    message?: string;
     data?: {
-        music_id: string;
-        status: number;
-        audio: string | null; // Can be null, empty string "", or URL during progressive generation
-        identify_id?: string;
-        [key: string]: any; // Allow other fields we don't need
+        task_id?: string;
     };
 }
 
-// Type for the data returned from getStatus endpoint
-type GetStatusData = NonNullable<GetStatusResponse['data']>;
+interface MusicItem {
+    music_id?: string;
+    task_id?: string;
+    status?: string;
+    audio_url?: string | null;
+    created_at?: string;
+}
 
+interface MusicListResponse {
+    success?: boolean;
+    message?: string;
+    data?: {
+        items?: MusicItem[];
+        pagination?: {
+            page?: number;
+            totalPages?: number;
+        };
+    };
+}
+
+interface MusicDetailResponse {
+    success?: boolean;
+    message?: string;
+    data?: MusicItem;
+}
+
+function sessionCookie(env: Env): string {
+    const token = env.AISONGGENERATOR_SESSION_TOKEN?.trim();
+    if (!token) {
+        throw new Error('AISONGGENERATOR_SESSION_TOKEN is missing');
+    }
+    return `__Secure-better-auth.session_token=${token}`;
+}
+
+export function aisgAuthHeaders(env: Env, json = false): HeadersInit {
+    const headers: Record<string, string> = {
+        Accept: 'application/json',
+        Cookie: sessionCookie(env),
+        Origin: ORIGIN,
+        Referer: `${ORIGIN}/create`,
+        'User-Agent': USER_AGENT,
+    };
+    if (json) {
+        headers['Content-Type'] = 'application/json';
+    }
+    return headers;
+}
+
+function mapStatus(status: string | undefined, hasAudio: boolean): number {
+    if (status === 'failed' || status === 'canceled') {
+        return -4;
+    }
+    if (status === 'completed' && hasAudio) {
+        return 4;
+    }
+    if (status === 'completed' || status === 'processing') {
+        return 2;
+    }
+    if (status === 'pending') {
+        return 1;
+    }
+    return 0;
+}
+
+function audioUrl(value: string | null | undefined): string | null {
+    if (typeof value === 'string' && value.trim() !== '') {
+        return value;
+    }
+    return null;
+}
+
+async function readJson<T>(response: Response): Promise<T | null> {
+    const text = await response.text();
+    if (!text) {
+        return null;
+    }
+    try {
+        return JSON.parse(text) as T;
+    } catch {
+        return null;
+    }
+}
+
+function buildSubmitBody(params: AiSongGeneratorGenerateParams): Record<string, unknown> {
+    const title = params.title?.trim() || undefined;
+
+    if (params.instrumental) {
+        const prompt = (params.description || '').trim().slice(0, EASY_PROMPT_LIMIT);
+        if (!prompt) {
+            throw new Error('Instrumental prompt is empty');
+        }
+        return {
+            prompt,
+            model: MUSIC_MODEL,
+            customMode: false,
+            instrumental: true,
+            is_private: !params.isPublic,
+            title,
+        };
+    }
+
+    const prompt = (params.lyrics || '').trim();
+    if (!prompt) {
+        throw new Error('Lyrics prompt is empty');
+    }
+    const style = params.styles.map(style => style.trim()).filter(Boolean).join(', ').slice(0, STYLE_LIMIT);
+    return {
+        prompt,
+        model: MUSIC_MODEL,
+        customMode: true,
+        instrumental: false,
+        is_private: !params.isPublic,
+        title,
+        style: style || undefined,
+    };
+}
+
+async function listMusic(env: Env, page: number): Promise<MusicListResponse> {
+    const response = await fetch(`${ORIGIN}/api/music/list?scope=library&page=${page}`, {
+        method: 'GET',
+        headers: aisgAuthHeaders(env),
+    });
+    const json = await readJson<MusicListResponse>(response);
+    if (!response.ok || !json?.success || !json.data?.items) {
+        throw new Error(`Failed to list songs: ${response.status} ${json?.message || ''}`.trim());
+    }
+    return json;
+}
+
+async function findMusicIds(env: Env, taskId: string): Promise<string[]> {
+    let found: MusicItem[] = [];
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+        if (attempt > 0) {
+            await new Promise(resolve => setTimeout(resolve, 800));
+        }
+
+        const page = await listMusic(env, 1);
+        found = (page.data?.items || []).filter(item => item.task_id === taskId && item.music_id);
+        if (found.length >= 2) {
+            break;
+        }
+        if (found.length === 1 && attempt >= 2) {
+            break;
+        }
+    }
+
+    if (found.length === 0) {
+        throw new Error('Song records were not found for the new task');
+    }
+
+    return found
+        .map(item => item.music_id as string)
+        .sort((a, b) => a.localeCompare(b));
+}
 
 /**
  * Generates a song using the aisonggenerator.io service.
  * @param params Parameters for song generation.
  * @param env Environment bindings.
- * @returns A promise that resolves to an array of task IDs.
+ * @returns Music ids for the songs created by this task.
  */
 export async function generateAiSongGeneratorSong(
     params: AiSongGeneratorGenerateParams,
     env: Env
 ): Promise<string[]> {
-    let body: any = {
-        lyrics_mode: true,
-        instrumental: false,
-        lyrics: "",
-        description: "",
-        title: params.title,
-        styles: params.styles.join(', '),
-        type: "lyrics",
-        model: "v4.0",
-        user_id: env.AISONGGENERATOR_USER_ID,
-        is_private: !params.isPublic, // Invert isPublic for is_private
-    };
-
-    if (params.instrumental) {
-        body.lyrics_mode = false;
-        body.instrumental = true;
-        body.description = params.description?.substring(0, 380) || ""; // Ensure description doesn't exceed max length
-        body.type = "desc";
-    } else {
-        body.lyrics = params.lyrics || "";
-    }
-
-    const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
-    const stub = env.DURABLE_OBJECT.get(doid);
-    const { access_token, refresh_token, expires_at } = await stub.getTokens();
-
-    const response = await fetch(`https://aisonggenerator.io/api/song`, {
+    const response = await fetch(`${ORIGIN}/api/music/submit`, {
         method: 'POST',
-        headers: {
-            // Ensure Cookie format is exactly as expected by the server
-            // Cookie: `sb-hjgeamyjogwwmvjydbfm-auth-token=${encodeURIComponent(JSON.stringify([access_token, refresh_token, null, null, null]))}`,
-            Cookie: `sb-hjgeamyjogwwmvjydbfm-auth-token.0=base64-${btoa(JSON.stringify({
-                access_token,
-                token_type: "bearer",
-                expires_in: 3600,
-                expires_at,
-                refresh_token
-            }))};`,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body)
+        headers: aisgAuthHeaders(env, true),
+        body: JSON.stringify(buildSubmitBody(params)),
     });
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error("aisonggenerator.io API error:", errorText);
-        throw new Error(`Failed to post song to aisonggenerator.io: ${response.status} ${errorText}`);
+    const json = await readJson<SubmitResponse>(response);
+    if (!response.ok || !json?.success || !json.data?.task_id) {
+        throw new Error(`Failed to post song to aisonggenerator.io: ${response.status} ${json?.message || ''}`.trim());
     }
 
-    const resJson: AiSongGeneratorApiResponse = await response.json();
-
-    if (resJson.task_id !== undefined && resJson.task_id !== null) { // Case 1: res.task_id (string or number)
-        return [String(resJson.task_id)];
-    } else if (resJson.data && typeof (resJson.data as { taskId?: string | number }).taskId !== 'undefined' && (resJson.data as { taskId?: string | number }).taskId !== null) { // Case 2: res.data.taskId (string or number)
-        return [String((resJson.data as { taskId: string | number }).taskId)];
-    } else if (resJson.data && (resJson.data as any).length !== undefined && (resJson.data as any).length > 0) { 
-        // Case 3: res.data with length > 0 (covers data being a non-empty array or non-empty string/number)
-        if (Array.isArray(resJson.data)) {
-            // Check if all items have music_id property (Case 3a: array of objects with music_id)
-            if (resJson.data.every((item: any) => item?.music_id !== undefined && item?.music_id !== null)) {
-                return resJson.data.map((item: any) => String(item.music_id)); // Extract and convert music_id to string
-            }
-            // Check if all items are strings or numbers (Case 3b: array of strings/numbers)
-            else if (resJson.data.every(item => typeof item === 'string' || typeof item === 'number')) {
-                return resJson.data.map(item => String(item)); // Convert all to string
-            }
-        } else if (typeof resJson.data === 'string' || typeof resJson.data === 'number') {
-            // data is a non-empty string or a number (length > 0 for string is checked by outer condition)
-            return [String(resJson.data)]; // Wrap and convert to string
-        }
-    } else if (resJson.jobs && resJson.jobs.length > 0 && resJson.jobs[0]?.id !== undefined && resJson.jobs[0]?.id !== null) { // Case 4: res.jobs with id (string or number)
-        return resJson.jobs.map((job: { id: string | number }) => String(job.id)); // Convert all to string
-    }
-    
-    console.error("Unexpected response structure from aisonggenerator.io or failed to extract valid task IDs:", resJson);
-    throw new Error('Failed to extract task_id from aisonggenerator.io response');
+    return findMusicIds(env, json.data.task_id);
 }
 
 /**
- * Retrieves song results from Supabase based on task IDs (identify_id).
- * @param taskIds An array of task IDs (identify_id in Supabase).
+ * Retrieves song results for music ids.
+ * @param musicIds Music ids returned by generateAiSongGeneratorSong.
  * @param env Environment bindings.
- * @param userIdArg Optional userId argument, to be prioritized
- * @returns A promise that resolves to an array of AiSongGeneratorSong objects.
+ * @returns Song rows in the same order as musicIds.
  */
 export async function getAiSongGeneratorSongResults(
-    taskIds: string[],
+    musicIds: string[],
     env: Env,
-    userIdArg?: string
+    _userIdArg?: string
 ): Promise<AiSongGeneratorSong[]> {
-    if (!taskIds || taskIds.length === 0) {
+    if (!musicIds || musicIds.length === 0) {
         return [];
     }
 
-    // Make parallel requests to the getStatus endpoint for each taskId
-    const responses = await Promise.all(
-        taskIds.map(async (id) => {
-            const response = await fetch(
-                `https://aisonggenerator.io/api/music-library/get-status?musicId=${id}`,
-                {
-                    method: 'GET',
-                    headers: {
-                        'Accept': 'application/json'
-                    }
-                }
-            );
+    const responses = await Promise.all(musicIds.map(async (id) => {
+        const response = await fetch(`${ORIGIN}/api/music/${encodeURIComponent(id)}`, {
+            method: 'GET',
+            headers: aisgAuthHeaders(env),
+        });
 
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error(`Failed to get status for musicId ${id}:`, errorText);
-                // Return null for failed requests instead of throwing to allow other requests to complete
-                return null;
-            }
-
-            const json: GetStatusResponse = await response.json();
-            // Check if response has success: true and data
-            if (json.success && json.data) {
-                return json.data;
-            }
+        if (!response.ok) {
+            const json = await readJson<MusicDetailResponse>(response);
+            console.error(`Failed to get status for musicId ${id}:`, response.status, json?.message || '');
             return null;
-        })
-    );
+        }
 
-    // Transform responses maintaining input order (taskIds order)
-    // Note: audio can be null or empty string during progressive generation - normalize to null
-    const results: AiSongGeneratorSong[] = [];
+        const json = await readJson<MusicDetailResponse>(response);
+        if (json?.success && json.data?.music_id) {
+            return json.data;
+        }
+        return null;
+    }));
 
-    for (let i = 0; i < taskIds.length; i++) {
-        const data = responses[i];
-        if (data !== null) {
-            results.push({
-                music_id: data.music_id,
-                status: data.status,
-                // Handle progressive generation: null, empty string "", or URL - normalize empty/null to null
-                audio: (data.audio && typeof data.audio === 'string' && data.audio.trim() !== '') ? data.audio : null,
-                identify_id: data.identify_id,
-                service: 'aisonggenerator' as const
-            });
-        } else {
-            results.push({
-                music_id: String(taskIds[i]),
+    return musicIds.map((id, index) => {
+        const data = responses[index];
+        if (!data) {
+            return {
+                music_id: id,
                 status: 0,
                 audio: null,
-                identify_id: String(taskIds[i]),
-                service: 'aisonggenerator' as const
-            });
+                identify_id: id,
+                service: 'aisonggenerator' as const,
+            };
         }
-    }
 
-    return results;
+        const audio = audioUrl(data.audio_url);
+        return {
+            music_id: data.music_id || id,
+            status: mapStatus(data.status, audio !== null),
+            audio,
+            identify_id: data.task_id,
+            service: 'aisonggenerator' as const,
+        };
+    });
 }

@@ -37,11 +37,11 @@ export default {
             console.error("Error refreshing Suno session during scheduled task:", e.message);
         }
 
-        // Refresh AISG token
+        // Confirm the AISG session cookie still signs in. There is no refresh token.
         try {
-            await stub.getTokens(true);
+            await stub.checkAisgSession();
         } catch (e: any) {
-            console.error("Error or Exception during AISG token refresh in scheduled task:", e.message);
+            console.error("Error or Exception during AISG session check in scheduled task:", e.message);
         }
 
         // Refresh Diffrhythm session token

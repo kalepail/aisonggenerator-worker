@@ -103,7 +103,7 @@ export interface TransformedSong {
  * Generates a song (lyrical or instrumental) using the Diffrhythm API.
  */
 export async function generateDiffRhythmSong(params: DiffRhythmGenerateParams, env: Env): Promise<string[]> {
-    const cfToken = await getCaptchaToken();
+    const cfToken = await getCaptchaToken(env.TWOCAPTCHA_API_KEY);
     const userId = params.userId || DEFAULT_USER_ID;
     const fingerprint = params.fingerprint || DEFAULT_FINGERPRINT;
 

@@ -1,4 +1,3 @@
-const CLIENT_KEY = "81470f9b83181efe43337ce564b6e72f";
 const CREATE_TASK_URL = "https://api.2captcha.com/createTask";
 const GET_TASK_RESULT_URL = "https://api.2captcha.com/getTaskResult";
 const WEBSITE_URL = "https://diffrhythm.ai/";
@@ -46,9 +45,9 @@ interface GetTaskResultResponse {
     solveCount?: number;
 }
 
-async function createTask(): Promise<number> {
+async function createTask(clientKey: string): Promise<number> {
     const body: CreateTaskRequestBody = {
-        clientKey: CLIENT_KEY,
+        clientKey,
         task: {
             type: "TurnstileTaskProxyless",
             websiteURL: WEBSITE_URL,
@@ -77,9 +76,9 @@ async function createTask(): Promise<number> {
     return data.taskId;
 }
 
-async function getTaskResult(taskId: number): Promise<GetTaskResultResponse> {
+async function getTaskResult(taskId: number, clientKey: string): Promise<GetTaskResultResponse> {
     const body: GetTaskResultRequestBody = {
-        clientKey: CLIENT_KEY,
+        clientKey,
         taskId: taskId,
     };
 
@@ -108,9 +107,13 @@ function delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export async function getCaptchaToken(): Promise<string> {
+export async function getCaptchaToken(clientKey: string): Promise<string> {
+    if (!clientKey) {
+        throw new Error("TWOCAPTCHA_API_KEY is missing");
+    }
+
     console.log("Attempting to get captcha token...");
-    const taskId = await createTask();
+    const taskId = await createTask(clientKey);
     console.log(`Task created with ID: ${taskId}`);
 
     let attempts = 0;
@@ -120,7 +123,7 @@ export async function getCaptchaToken(): Promise<string> {
         await delay(POLLING_INTERVAL);
 
         try {
-            const result = await getTaskResult(taskId);
+            const result = await getTaskResult(taskId, clientKey);
             console.log(`Current task status: ${result.status}`);
 
             if (result.errorId !== 0 && result.status !== "processing") {

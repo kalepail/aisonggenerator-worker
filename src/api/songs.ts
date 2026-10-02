@@ -50,8 +50,8 @@ export async function getSongs(ctx: Context<{ Bindings: Env }>) {
 
     try {
         if (source === 'aisonggenerator') {
-            // For aisonggenerator, ids are task_ids (identify_id)
-            // Env is passed directly; getAiSongGeneratorSongResults will use userId from env
+            // For aisonggenerator, ids are music ids from /api/music/submit
+            // Env is passed directly; getAiSongGeneratorSongResults will use the session cookie
             results = await getAiSongGeneratorSongResults(ids, env);
         } else if (source === 'diffrhythm') {
             // For diffrhythm, ids are uids

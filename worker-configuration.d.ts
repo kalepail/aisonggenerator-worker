@@ -6,6 +6,8 @@ declare namespace Cloudflare {
 		AISONGGENERATOR_USER_ID: string;
 		AISONGGENERATOR_API_KEY: string;
 		AISONGGENERATOR_REFRESH_TOKEN: string;
+		AISONGGENERATOR_SESSION_TOKEN: string;
+		TWOCAPTCHA_API_KEY: string;
 		SUNO_SESSION_TOKEN: string;
 		DIFFRHYTHM_SESSION_COOKIE: string;
 		DURABLE_OBJECT: DurableObjectNamespace<import("./src/index").DO>;
