@@ -28,7 +28,6 @@ const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/
 
 interface SubmitResponse {
     success?: boolean;
-    message?: string;
     data?: {
         task_id?: string;
     };
@@ -44,7 +43,6 @@ interface MusicItem {
 
 interface MusicListResponse {
     success?: boolean;
-    message?: string;
     data?: {
         items?: MusicItem[];
         pagination?: {
@@ -56,7 +54,6 @@ interface MusicListResponse {
 
 interface MusicDetailResponse {
     success?: boolean;
-    message?: string;
     data?: MusicItem;
 }
 
@@ -155,10 +152,11 @@ async function listMusic(env: Env, page: number): Promise<MusicListResponse> {
     const response = await fetch(`${ORIGIN}/api/music/list?scope=library&page=${page}`, {
         method: 'GET',
         headers: aisgAuthHeaders(env),
+        signal: AbortSignal.timeout(10000),
     });
     const json = await readJson<MusicListResponse>(response);
     if (!response.ok || !json?.success || !json.data?.items) {
-        throw new Error(`Failed to list songs: ${response.status} ${json?.message || ''}`.trim());
+        throw new Error(`AISG song list request failed (HTTP ${response.status})`);
     }
     return json;
 }
@@ -208,7 +206,7 @@ export async function generateAiSongGeneratorSong(
 
     const json = await readJson<SubmitResponse>(response);
     if (!response.ok || !json?.success || !json.data?.task_id) {
-        throw new Error(`Failed to post song to aisonggenerator.io: ${response.status} ${json?.message || ''}`.trim());
+        throw new Error(`AISG song submission failed (HTTP ${response.status})`);
     }
 
     return findMusicIds(env, json.data.task_id);
@@ -233,11 +231,14 @@ export async function getAiSongGeneratorSongResults(
         const response = await fetch(`${ORIGIN}/api/music/${encodeURIComponent(id)}`, {
             method: 'GET',
             headers: aisgAuthHeaders(env),
+            signal: AbortSignal.timeout(10000),
         });
 
+        if (response.status === 401 || response.status === 403) {
+            throw new Error(`AISG song status request was unauthorized (HTTP ${response.status})`);
+        }
         if (!response.ok) {
-            const json = await readJson<MusicDetailResponse>(response);
-            console.error(`Failed to get status for musicId ${id}:`, response.status, json?.message || '');
+            console.warn(`AISG song status request failed (HTTP ${response.status})`);
             return null;
         }
 

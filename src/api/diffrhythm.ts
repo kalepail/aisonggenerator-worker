@@ -84,17 +84,18 @@ async function diffrhythmFetch(url: string, cookie: string, init: RequestInit = 
     const headers = cookieHeaders(cookie, init.body != null);
     const extra = new Headers(init.headers);
     extra.forEach((value, key) => headers.set(key, value));
-    const response = await fetch(url, { ...init, headers });
+    const options = { ...init, headers, signal: init.signal ?? AbortSignal.timeout(10000) };
+    const response = await fetch(url, options);
     if (response.status !== 426) {
         return response;
     }
     const nextVersion = response.headers.get("x-app-version");
-    await response.arrayBuffer();
     if (!nextVersion || nextVersion === CLIENT_VERSION) {
         return response;
     }
+    await response.body?.cancel();
     headers.set("x-client-version", nextVersion);
-    return fetch(url, { ...init, headers });
+    return fetch(url, options);
 }
 
 function sessionCookieFromResponse(response: Response): string {
@@ -112,7 +113,7 @@ function sessionCookieFromResponse(response: Response): string {
 
 export async function refreshDiffrhythmCookie(candidates: string[]): Promise<string> {
     const seen = new Set<string>();
-    let lastStatus = 0;
+    let failure = "DiffRhythm session cookie is missing";
     for (const candidate of candidates) {
         const cookie = normalizeDiffrhythmCookie(candidate);
         if (!cookie || seen.has(cookie)) {
@@ -121,8 +122,8 @@ export async function refreshDiffrhythmCookie(candidates: string[]): Promise<str
         seen.add(cookie);
         const response = await diffrhythmFetch(SESSION_URL, cookie);
         const json = await response.json().catch(() => null) as { user?: { id?: string } } | null;
-        lastStatus = response.status;
         if (!response.ok || !json?.user?.id) {
+            failure = `DiffRhythm session has no user (HTTP ${response.status})`;
             continue;
         }
         // A diffrhythm.com session can decode on aisinging.ai and still be unauthorized.
@@ -131,9 +132,9 @@ export async function refreshDiffrhythmCookie(candidates: string[]): Promise<str
         if (account.ok && accountJson?.data && "credits" in accountJson.data) {
             return sessionCookieFromResponse(response) || cookie;
         }
-        lastStatus = account.status;
+        failure = `DiffRhythm account check failed (HTTP ${account.status})`;
     }
-    throw new Error(`DiffRhythm session has no user (${lastStatus})`);
+    throw new Error(failure);
 }
 
 function taskBody(params: DiffRhythmGenerateParams): { featureKey: string; input: Record<string, unknown> } {

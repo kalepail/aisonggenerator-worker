@@ -17,7 +17,7 @@ Songs should be relatively short, just 2-3 verses long.`
         },
     ];
 
-    return env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+    const result = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
         messages,
         max_tokens: 1024,
         temperature: 0.8,
@@ -39,4 +39,27 @@ Songs should be relatively short, just 2-3 verses long.`
             },
         },
     });
+
+    let draft: unknown = result && "response" in result ? result.response : undefined;
+    if (typeof draft === "string") {
+        const json = draft.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+        try {
+            draft = JSON.parse(json);
+        } catch {
+            throw new Error("Cloudflare AI returned invalid JSON");
+        }
+    }
+
+    const song = draft as { title?: unknown; lyrics?: unknown; style?: unknown } | null;
+    if (typeof song?.title !== "string" || !song.title.trim()
+        || typeof song.lyrics !== "string" || !song.lyrics.trim()
+        || !Array.isArray(song.style) || !song.style.every(tag => typeof tag === "string")) {
+        throw new Error("Cloudflare AI response does not match the lyrics schema");
+    }
+
+    return {
+        title: song.title.trim(),
+        lyrics: song.lyrics.trim(),
+        style: song.style.map(tag => tag.trim()).filter(Boolean),
+    };
 }

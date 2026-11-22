@@ -25,30 +25,26 @@ app
     })
     .notFound((ctx) => ctx.body(null, 404))
 
+async function checkSession(name: string, check: () => Promise<unknown>) {
+    try {
+        await check();
+        console.log(`${name} session check succeeded`);
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : "Unknown error";
+        console.error(`${name} session check failed:`, detail);
+    }
+}
+
 export default {
     fetch: app.fetch,
     async scheduled(ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
         const doid = env.DURABLE_OBJECT.idFromName('v0.0.0');
         const stub = env.DURABLE_OBJECT.get(doid);
 
-        try {
-            await getClerkToken();
-        } catch (e: any) {
-            console.error("Error refreshing Suno session during scheduled task:", e.message);
-        }
-
-        // Confirm the AISG session cookie still signs in. There is no refresh token.
-        try {
-            await stub.checkAisgSession();
-        } catch (e: any) {
-            console.error("Error or Exception during AISG session check in scheduled task:", e.message);
-        }
-
-        // Extend the aisinging.ai session cookie.
-        try {
-            await stub.getDiffrhythmSession(true);
-        } catch (e: any) {
-            console.error("Error refreshing Diffrhythm session during scheduled task:", e.message);
-        }
+        await Promise.all([
+            checkSession("Suno", () => getClerkToken(env)),
+            checkSession("AISG", () => stub.checkAisgSession()),
+            checkSession("DiffRhythm", () => stub.getDiffrhythmSession(true)),
+        ]);
     },
 }
