@@ -1,140 +1,241 @@
-import { Context } from "hono";
-import { HTTPException } from "hono/http-exception";
-import { getLyrics as getSunoLyrics } from "./suno";
-import { songWrite } from "./cf";
-import { aisgAuthHeaders } from "./aisonggenerator";
-import { hasUnexpectedChinese } from "./language";
+import { Context } from 'hono';
+import { songWrite } from './cf';
+import { aisgAuthHeaders } from './aisonggenerator';
+import { ProviderError, isTimeoutError } from './errors';
+import { hasUnexpectedChinese } from './language';
 
 // Define the unified response type
 export interface UnifiedLyricsResponse {
-    title: string | null;
-    lyrics: string | null;
-    style: string[];
-    service: string;
+	title: string;
+	lyrics: string;
+	style: string[];
+	service: string;
+}
+
+type LyricsFailureReason =
+	| 'auth_error'
+	| 'http_error'
+	| 'timeout'
+	| 'network_error'
+	| 'invalid_payload'
+	| 'unexpected_chinese'
+	| 'all_models_failed'
+	| 'service_failed';
+
+class LyricsServiceError extends Error {
+	readonly reason: LyricsFailureReason;
+	readonly upstreamStatus?: number;
+
+	constructor(reason: LyricsFailureReason, upstreamStatus?: number) {
+		super(reason);
+		this.name = 'LyricsServiceError';
+		this.reason = reason;
+		this.upstreamStatus = upstreamStatus;
+	}
 }
 
 // Service definition for cleaner iteration
 interface LyricsService {
-    name: string;
-    fetch: (prompt: string, env: Env) => Promise<UnifiedLyricsResponse>;
+	name: 'aisonggenerator.io' | 'cloudflare-ai';
+	fetch: (prompt: string, env: Env) => Promise<UnifiedLyricsResponse>;
 }
 
 export const AISG_LYRICS_MAX_ATTEMPTS = 3;
+export const MIN_STYLE_TAGS = 2;
 
 const LANGUAGE_RETRY_REMINDER =
-    "\n\nIMPORTANT: Write the title, lyrics, and style tags strictly in the exact language of the prompt above. Do not switch to another language.";
+	'\n\nIMPORTANT: Write the title, lyrics, and style tags strictly in the exact language of the prompt above. Do not switch to another language.';
 
 async function fetchAisgLyricsOnce(prompt: string, env: Env): Promise<UnifiedLyricsResponse> {
-    const res = await fetch("https://aisonggenerator.io/api/music/lyrics/generate", {
-        method: "POST",
-        headers: aisgAuthHeaders(env, true),
-        body: JSON.stringify({
-            action: "generate",
-            model: "openrouter/auto",
-            prompt,
-        }),
-        signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) {
-        throw new Error(`Lyric generation request failed (HTTP ${res.status})`);
-    }
-    const response = await res.json().catch(() => null) as {
-        title?: unknown; lyrics?: unknown; tags?: unknown; style?: unknown;
-    } | null;
-    const tagText = typeof response?.tags === "string"
-        ? response.tags
-        : (typeof response?.style === "string" ? response.style : "");
-    const style = tagText.split(",").map((item: string) => item.trim()).filter(Boolean);
-    if (typeof response?.lyrics === "string" && response.lyrics.trim()
-        && typeof response.title === "string" && response.title.trim() && style.length > 0) {
-        return {
-            title: response.title.trim(),
-            service: "aisonggenerator.io",
-            lyrics: response.lyrics.trim(),
-            style,
-        };
-    }
-    throw new Error("Response missing lyrics, title, or tags");
+	let headers: HeadersInit;
+	try {
+		headers = aisgAuthHeaders(env, true);
+	} catch {
+		throw new LyricsServiceError('auth_error');
+	}
+
+	let res: Response;
+	try {
+		res = await fetch('https://aisonggenerator.io/api/music/lyrics/generate', {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({
+				action: 'generate',
+				model: 'openrouter/auto',
+				prompt,
+			}),
+			signal: AbortSignal.timeout(10000),
+		});
+	} catch (error) {
+		throw new LyricsServiceError(isTimeoutError(error) ? 'timeout' : 'network_error');
+	}
+
+	if (!res.ok) {
+		throw new LyricsServiceError(res.status === 401 || res.status === 403 ? 'auth_error' : 'http_error', res.status);
+	}
+
+	const response = (await res.json().catch(() => null)) as {
+		title?: unknown;
+		lyrics?: unknown;
+		tags?: unknown;
+		style?: unknown;
+	} | null;
+	const tagText =
+		typeof response?.tags === 'string'
+			? response.tags
+			: typeof response?.style === 'string'
+				? response.style
+				: '';
+	const style = tagText
+		.split(',')
+		.map((item: string) => item.trim())
+		.filter(Boolean);
+	if (
+		typeof response?.lyrics === 'string' &&
+		response.lyrics.trim() &&
+		typeof response.title === 'string' &&
+		response.title.trim() &&
+		style.length >= MIN_STYLE_TAGS
+	) {
+		return {
+			title: response.title.trim(),
+			service: 'aisonggenerator.io',
+			lyrics: response.lyrics.trim(),
+			style,
+		};
+	}
+	throw new LyricsServiceError('invalid_payload');
 }
 
 const lyricsServices: LyricsService[] = [
-    {
-        name: "aisonggenerator.io",
-        fetch: async (prompt, env) => {
-            for (let attempt = 1; attempt <= AISG_LYRICS_MAX_ATTEMPTS; attempt++) {
-                const attemptPrompt = attempt === 1 ? prompt : `${prompt}${LANGUAGE_RETRY_REMINDER}`;
-                const result = await fetchAisgLyricsOnce(attemptPrompt, env);
-                if (!hasUnexpectedChinese(prompt, result)) {
-                    return result;
-                }
-                console.warn(
-                    `aisonggenerator.io attempt ${attempt}/${AISG_LYRICS_MAX_ATTEMPTS} returned unexpected Chinese output`
-                );
-            }
-            throw new Error(
-                `aisonggenerator.io returned unexpected Chinese output after ${AISG_LYRICS_MAX_ATTEMPTS} attempts`
-            );
-        }
-    },
-    {
-        name: "suno",
-        fetch: async (prompt, env) => {
-            const sunoResponse = await getSunoLyrics(env, prompt);
-            if (typeof sunoResponse.text === "string" && sunoResponse.text.trim()
-                && typeof sunoResponse.title === "string" && sunoResponse.title.trim()) {
-                const result: UnifiedLyricsResponse = {
-                    title: sunoResponse.title.trim(),
-                    service: "suno",
-                    lyrics: sunoResponse.text.trim(),
-                    style: Array.isArray(sunoResponse.tags) ? sunoResponse.tags.filter(tag => typeof tag === "string") : [],
-                };
-                if (hasUnexpectedChinese(prompt, result)) {
-                    throw new Error("Suno returned unexpected Chinese output");
-                }
-                return result;
-            }
-            throw new Error("Suno response is missing lyrics or title");
-        }
-    },
-    {
-        name: "cloudflare-ai",
-        fetch: async (prompt, env) => ({ ...await songWrite(env, prompt), service: "cloudflare-ai" }),
-    }
+	{
+		name: 'aisonggenerator.io',
+		fetch: async (prompt, env) => {
+			for (let attempt = 1; attempt <= AISG_LYRICS_MAX_ATTEMPTS; attempt++) {
+				const attemptPrompt = attempt === 1 ? prompt : `${prompt}${LANGUAGE_RETRY_REMINDER}`;
+				const result = await fetchAisgLyricsOnce(attemptPrompt, env);
+				if (!hasUnexpectedChinese(prompt, result)) {
+					return result;
+				}
+				console.warn(
+					JSON.stringify({
+						event: 'aisg_lyrics_unexpected_chinese',
+						attempt,
+						max_attempts: AISG_LYRICS_MAX_ATTEMPTS,
+					})
+				);
+			}
+			throw new LyricsServiceError('unexpected_chinese');
+		},
+	},
+	{
+		name: 'cloudflare-ai',
+		fetch: async (prompt, env) => {
+			try {
+				return { ...(await songWrite(env, prompt)), service: 'cloudflare-ai' };
+			} catch {
+				throw new LyricsServiceError('all_models_failed');
+			}
+		},
+	},
 ];
 
+function invalidLyricsRequest(message: string): ProviderError {
+	return new ProviderError(message, {
+		status: 400,
+		provider: 'lyrics',
+		code: 'invalid_request',
+		retryable: false,
+		outcome: 'rejected',
+	});
+}
+
+function classifyLyricsFailure(error: unknown): { reason: LyricsFailureReason; upstreamStatus?: number } {
+	if (error instanceof LyricsServiceError) {
+		return { reason: error.reason, upstreamStatus: error.upstreamStatus };
+	}
+	if (isTimeoutError(error)) {
+		return { reason: 'timeout' };
+	}
+	return { reason: 'service_failed' };
+}
+
 export async function generateLyricsWithFallback(prompt: string, env: Env): Promise<UnifiedLyricsResponse> {
-    const errors: string[] = [];
+	const trimmedPrompt = prompt.trim();
+	if (!trimmedPrompt) {
+		throw invalidLyricsRequest('Prompt is required');
+	}
 
-    for (const service of lyricsServices) {
-        try {
-            console.log(`Attempting lyrics generation with ${service.name}...`);
-            const result = await service.fetch(prompt, env);
-            console.log(`Successfully generated lyrics with ${service.name}`);
-            return result;
-        } catch (error) {
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            console.warn(`${service.name} failed: ${errorMsg}`);
-            errors.push(`${service.name}: ${errorMsg}`);
-        }
-    }
+	const failures: Array<{ service: string; reason: LyricsFailureReason; upstream_status?: number }> = [];
 
-    console.error("All lyrics services failed:", errors);
-    throw new HTTPException(500, { message: `All lyric generation services failed. Errors: ${errors.join("; ")}` });
+	for (const service of lyricsServices) {
+		try {
+			const result = await service.fetch(trimmedPrompt, env);
+			return result;
+		} catch (error) {
+			const detail = classifyLyricsFailure(error);
+			const entry = {
+				service: service.name,
+				reason: detail.reason,
+				...(detail.upstreamStatus !== undefined ? { upstream_status: detail.upstreamStatus } : {}),
+			};
+			console.warn(JSON.stringify({ event: 'lyrics_service_failed', ...entry }));
+			failures.push(entry);
+		}
+	}
+
+	console.error(JSON.stringify({ event: 'lyrics_all_services_failed', failures }));
+	throw new ProviderError('All lyric generation services failed', {
+		status: 503,
+		provider: 'lyrics',
+		code: 'lyrics_unavailable',
+		retryable: true,
+		outcome: 'rejected',
+	});
 }
 
 export async function lyrics(ctx: Context<{ Bindings: Env }>) {
-    const { req } = ctx;
-    const requestBody = await req.text();
-    let prompt: string | undefined;
+	const contentType = (ctx.req.header('content-type') || '').toLowerCase();
+	const isDeclaredJson = contentType.includes('application/json') || contentType.includes('+json');
+	const requestBody = await ctx.req.text();
+	let prompt = '';
 
-    try {
-        const parsedBody = JSON.parse(requestBody);
-        prompt = parsedBody.prompt;
-    } catch {
-        // If parsing fails, assume the body itself is the prompt string
-        prompt = requestBody;
-    }
+	if (isDeclaredJson) {
+		let parsedBody: unknown;
+		try {
+			parsedBody = JSON.parse(requestBody);
+		} catch {
+			throw invalidLyricsRequest('Invalid JSON request body');
+		}
+		if (
+			!parsedBody ||
+			typeof parsedBody !== 'object' ||
+			Array.isArray(parsedBody) ||
+			typeof (parsedBody as { prompt?: unknown }).prompt !== 'string'
+		) {
+			throw invalidLyricsRequest("JSON request body must include a string 'prompt'");
+		}
+		prompt = (parsedBody as { prompt: string }).prompt;
+	} else if (requestBody.trim()) {
+		// Preserve raw-text lyrics callers (e.g. text/plain or omitted Content-Type),
+		// while still accepting valid JSON objects sent without a JSON Content-Type header.
+		try {
+			const parsedBody: unknown = JSON.parse(requestBody);
+			if (
+				parsedBody &&
+				typeof parsedBody === 'object' &&
+				!Array.isArray(parsedBody) &&
+				typeof (parsedBody as { prompt?: unknown }).prompt === 'string'
+			) {
+				prompt = (parsedBody as { prompt: string }).prompt;
+			} else {
+				prompt = requestBody;
+			}
+		} catch {
+			prompt = requestBody;
+		}
+	}
 
-    const result = await generateLyricsWithFallback(prompt || "", ctx.env);
-    return ctx.json(result);
+	const result = await generateLyricsWithFallback(prompt, ctx.env);
+	return ctx.json(result);
 }

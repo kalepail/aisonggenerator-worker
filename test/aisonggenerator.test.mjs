@@ -1,38 +1,17 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import test, { after, before } from "node:test";
-import { pathToFileURL } from "node:url";
-import { createRequire } from "node:module";
+import { createTestBundler } from "./helpers.mjs";
 
-const require = createRequire(import.meta.url);
-const wranglerDir = fs.realpathSync(path.resolve("node_modules/wrangler"));
-const esbuild = require(require.resolve("esbuild", {
-	paths: [wranglerDir, path.dirname(wranglerDir)],
-}));
-
-let tmpDir;
+let bundler;
 let aisgMod;
 
 before(async () => {
-	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aisg-api-test-"));
-	const outfile = path.join(tmpDir, "aisonggenerator.mjs");
-	await esbuild.build({
-		entryPoints: [path.resolve("src/api/aisonggenerator.ts")],
-		outfile,
-		bundle: true,
-		format: "esm",
-		platform: "node",
-		target: "node20",
-	});
-	aisgMod = await import(pathToFileURL(outfile).href);
+	bundler = createTestBundler("aisg-api-test-");
+	aisgMod = await bundler.bundle("src/api/aisonggenerator.ts", "aisonggenerator.mjs");
 });
 
 after(() => {
-	if (tmpDir) {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
-	}
+	bundler?.cleanup();
 });
 
 test("buildSubmitBody keeps model v6, clamps limits, and passes free optional params", () => {
@@ -105,102 +84,113 @@ test("buildSubmitBody keeps model v6, clamps limits, and passes free optional pa
 	assert.equal("lyrics_compatibility_level" in easyBody, false);
 });
 
-test("generateAiSongGeneratorSong distinguishes insufficient credits from generic 403 and forwards workspace_id", async () => {
+test("findMusicIds waits past attempt 2, rechecks page 1 on 100-page library, and handles strict vs legacy exhaustion", async () => {
 	const origFetch = globalThis.fetch;
-	const env = {
-		AISONGGENERATOR_SESSION_TOKEN: "secret-session-token",
-		AISONGGENERATOR_WORKSPACE_ID: "ws_smol",
-	};
+	const env = { AISONGGENERATOR_SESSION_TOKEN: "tok", AISONGGENERATOR_WORKSPACE_ID: "ws_1" };
 
 	try {
-		// 1) Insufficient credits on HTTP 403
-		globalThis.fetch = async () =>
-			new Response(JSON.stringify({ success: false, message: "Insufficient credits", email: "private@example.com" }), {
-				status: 403,
+		// 1) Returns 1 song on attempts 1..3 and both songs on attempt 4 (previously early-broke on attempt 3)
+		let listCalls = 0;
+		globalThis.fetch = async (url) => {
+			assert.equal(String(url), "https://aisonggenerator.io/api/music/list?scope=library&page=1&workspace_id=ws_1");
+			listCalls++;
+			const items =
+				listCalls < 4
+					? [{ task_id: "task_99", music_id: "m_b" }]
+					: [
+							{ task_id: "task_99", music_id: "m_b" },
+							{ task_id: "task_99", music_id: "m_a" },
+						];
+			return new Response(JSON.stringify({ success: true, data: { items, pagination: { page: 1, totalPages: 1 } } }), {
+				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});
+		};
 
-		await assert.rejects(
-			() =>
-				aisgMod.generateAiSongGeneratorSong(
-					{
-						title: "Test",
-						styles: ["lofi"],
-						instrumental: true,
-						description: "Cozy rain",
-						isPublic: false,
-					},
-					env
-				),
-			/AISG song submission failed: insufficient credits \(HTTP 403\)/
-		);
+		const ids = await aisgMod.findMusicIds(env, "task_99", "ws_1", { maxAttempts: 6, delayMs: 0 });
+		assert.equal(listCalls, 4);
+		assert.deepEqual(ids, ["m_a", "m_b"]);
 
-		// 2) Generic 403 does not claim insufficient credits or leak body text
-		globalThis.fetch = async () =>
-			new Response(JSON.stringify({ success: false, message: "Forbidden for sensitive-user@example.com" }), {
-				status: 403,
-				headers: { "Content-Type": "application/json" },
-			});
-
-		await assert.rejects(
-			() =>
-				aisgMod.generateAiSongGeneratorSong(
-					{
-						title: "Test",
-						styles: ["lofi"],
-						instrumental: true,
-						description: "Cozy rain",
-						isPublic: false,
-					},
-					env
-				),
-			(err) => {
-				assert.equal(err.message, "AISG song submission failed (HTTP 403)");
-				assert.doesNotMatch(err.message, /sensitive-user/);
-				return true;
+		// 2) 100-page library where pair becomes visible on page 1 AFTER the first page-1 read:
+		//    must recheck page 1 on attempt 2 rather than advancing to pages 6..30 and returning 504!
+		let page1Reads = 0;
+		const seenPages = [];
+		globalThis.fetch = async (url) => {
+			const page = Number(new URL(String(url)).searchParams.get("page"));
+			seenPages.push(page);
+			if (page === 1) {
+				page1Reads++;
+				const items =
+					page1Reads >= 2
+						? [
+								{ task_id: "task_deep_head", music_id: "m_2" },
+								{ task_id: "task_deep_head", music_id: "m_1" },
+							]
+						: [];
+				return Response.json({ success: true, data: { items, pagination: { page: 1, totalPages: 100 } } });
 			}
-		);
+			return Response.json({ success: true, data: { items: [], pagination: { page, totalPages: 100 } } });
+		};
 
-		// 3) Success forwards workspace_id to both submit and library list
-		const seenUrls = [];
-		let submitBody = null;
-		globalThis.fetch = async (url, init) => {
-			const urlStr = String(url);
-			seenUrls.push(urlStr);
-			if (urlStr.endsWith("/api/music/submit")) {
-				submitBody = JSON.parse(init.body);
-				return new Response(JSON.stringify({ success: true, data: { task_id: "task_42" } }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				});
+		const deepHeadIds = await aisgMod.findMusicIds(env, "task_deep_head", "ws_1", { maxAttempts: 6, delayMs: 0 });
+		assert.deepEqual(deepHeadIds, ["m_1", "m_2"]);
+		assert.equal(page1Reads, 2);
+		assert.deepEqual(seenPages, [1, 2, 3, 4, 5, 1]);
+
+		// 2b) Transient 503 on optional deeper page (page 2) MUST NOT abort discovery before page 1's second read!
+		let page1ReadsAfter503 = 0;
+		globalThis.fetch = async (url) => {
+			const page = Number(new URL(String(url)).searchParams.get("page"));
+			if (page === 1) {
+				page1ReadsAfter503++;
+				const items =
+					page1ReadsAfter503 >= 2
+						? [
+								{ task_id: "task_p2_503", music_id: "r_2" },
+								{ task_id: "task_p2_503", music_id: "r_1" },
+							]
+						: [];
+				return Response.json({ success: true, data: { items, pagination: { page: 1, totalPages: 100 } } });
 			}
+			return new Response("Service Unavailable", { status: 503 });
+		};
+		const recoveredIds = await aisgMod.findMusicIds(env, "task_p2_503", "ws_1", { maxAttempts: 6, delayMs: 0 });
+		assert.deepEqual(recoveredIds, ["r_1", "r_2"]);
+		assert.equal(page1ReadsAfter503, 2);
+
+		// 3) Strict mode (default): loop exhaustion with 1 song throws ProviderError(504, outcome: 'unknown', taskId)
+		let exhaustedCalls = 0;
+		globalThis.fetch = async () => {
+			exhaustedCalls++;
 			return new Response(
 				JSON.stringify({
 					success: true,
-					data: {
-						items: [
-							{ task_id: "task_42", music_id: "m_2" },
-							{ task_id: "task_42", music_id: "m_1" },
-						],
-					},
+					data: { items: [{ task_id: "task_partial", music_id: "m_only" }], pagination: { page: 1, totalPages: 1 } },
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } }
 			);
 		};
 
-		const ids = await aisgMod.generateAiSongGeneratorSong(
-			{
-				title: "Test",
-				styles: ["lofi"],
-				instrumental: true,
-				description: "Cozy rain",
-				isPublic: true,
-			},
-			env
+		await assert.rejects(
+			() => aisgMod.findMusicIds(env, "task_partial", "ws_1", { maxAttempts: 3, delayMs: 0 }),
+			(err) => {
+				assert.equal(err.status, 504);
+				assert.equal(err.code, "aisg_task_not_found");
+				assert.equal(err.retryable, false);
+				assert.equal(err.outcome, "unknown");
+				assert.equal(err.taskId, "task_partial");
+				return true;
+			}
 		);
-		assert.deepEqual(ids, ["m_1", "m_2"]);
-		assert.equal(submitBody.workspace_id, "ws_smol");
-		assert.equal(seenUrls[1], "https://aisonggenerator.io/api/music/list?scope=library&page=1&workspace_id=ws_smol");
+		assert.equal(exhaustedCalls, 3);
+
+		// 4) Unkeyed legacy compatibility mode (allowSingletonOnExhaustion: true) preserves non-retrying 1-ID return
+		const legacySingle = await aisgMod.findMusicIds(env, "task_partial", "ws_1", {
+			maxAttempts: 3,
+			delayMs: 0,
+			allowSingletonOnExhaustion: true,
+		});
+		assert.deepEqual(legacySingle, ["m_only"]);
 	} finally {
 		globalThis.fetch = origFetch;
 	}
@@ -299,55 +289,83 @@ test("optimizeAisgStyle and recoverAisgAudio call free utility endpoints cleanly
 	}
 });
 
-test("getAiSongGeneratorSongResults preserves fields, falls back to audio_source, and surfaces diagnostics", async () => {
+test("getAiSongGeneratorSongResults reserves pending for explicit missing and surfaces 5xx, empty 200, and success:false as read errors", async () => {
 	const origFetch = globalThis.fetch;
 
 	globalThis.fetch = async (url) => {
 		const urlStr = String(url);
 		if (urlStr.endsWith("/api/music/m_ok")) {
-			return new Response(
-				JSON.stringify({
-					success: true,
-					data: {
-						music_id: "m_ok",
-						task_id: "t_1",
-						status: "completed",
-						audio_url: null,
-						processing_results: {
-							audio_source: { url: "https://cdn.example/m_ok.mp3", format: "mp3" },
-						},
-						duration: 193.6,
-						provider: "sun",
-						credits_cost: 4,
-						credits_refunded: false,
-						error_message: "ignored on completed song",
-					},
-				}),
-				{ status: 200, headers: { "Content-Type": "application/json" } }
-			);
-		}
-		return new Response(
-			JSON.stringify({
+			return Response.json({
 				success: true,
 				data: {
-					music_id: "m_fail",
+					music_id: "m_ok",
+					task_id: "t_1",
+					status: "completed",
+					audio_url: null,
+					processing_results: {
+						audio_source: { url: "https://cdn.example/m_ok.mp3", format: "mp3" },
+					},
+					duration: 193.6,
+					provider: "sun",
+					credits_cost: 4,
+					credits_refunded: false,
+					error_message: "ignored on completed song",
+				},
+			});
+		}
+		if (urlStr.endsWith("/api/music/m_timeout")) {
+			return Response.json({
+				success: true,
+				data: {
+					music_id: "m_timeout",
 					task_id: "t_1",
 					status: "failed",
 					audio_url: null,
 					provider: "kie",
 					credits_cost: 0,
 					credits_refunded: true,
-					error_message: "Upstream timeout\n   " + "x".repeat(250),
+					error_message: "Upstream timeout for CANARY_LEAK_TOKEN_99",
 				},
-			}),
-			{ status: 200, headers: { "Content-Type": "application/json" } }
-		);
+			});
+		}
+		if (urlStr.endsWith("/api/music/m_policy")) {
+			return Response.json({
+				success: true,
+				data: {
+					music_id: "m_policy",
+					task_id: "t_1",
+					status: "failed",
+					audio_url: null,
+					error_message: "Copyright policy violation on CANARY_PRIVATE_EMAIL@example.com",
+				},
+			});
+		}
+		if (urlStr.endsWith("/api/music/m_404")) {
+			return new Response("not found", { status: 404 });
+		}
+		if (urlStr.endsWith("/api/music/m_explicit_null")) {
+			return Response.json({ success: true, data: null });
+		}
+		if (urlStr.endsWith("/api/music/m_omitted_data")) {
+			return Response.json({ success: true });
+		}
+		if (urlStr.endsWith("/api/music/m_empty_200")) {
+			return new Response("", { status: 200 });
+		}
+		if (urlStr.endsWith("/api/music/m_app_false")) {
+			return Response.json({ success: false, message: "database unavailable" }, { status: 200 });
+		}
+		if (urlStr.endsWith("/api/music/m_weird_envelope")) {
+			return Response.json({ unexpected: true }, { status: 200 });
+		}
+		return new Response("Bad Gateway", { status: 502 });
 	};
 
 	try {
-		const rows = await aisgMod.getAiSongGeneratorSongResults(["m_ok", "m_fail"], {
-			AISONGGENERATOR_SESSION_TOKEN: "tok",
-		});
+		const rows = await aisgMod.getAiSongGeneratorSongResults(
+			["m_ok", "m_timeout", "m_policy", "m_404", "m_explicit_null"],
+			{ AISONGGENERATOR_SESSION_TOKEN: "tok" }
+		);
 
 		assert.deepEqual(rows[0], {
 			music_id: "m_ok",
@@ -361,14 +379,32 @@ test("getAiSongGeneratorSongResults preserves fields, falls back to audio_source
 			credits_refunded: false,
 		});
 
-		assert.equal(rows[1].music_id, "m_fail");
 		assert.equal(rows[1].status, -4);
-		assert.equal(rows[1].audio, null);
-		assert.equal(rows[1].provider, "kie");
-		assert.equal(rows[1].credits_cost, 0);
-		assert.equal(rows[1].credits_refunded, true);
-		assert.equal(rows[1].error_message.length, 200);
-		assert.match(rows[1].error_message, /^Upstream timeout x+/);
+		assert.equal(rows[1].error_message, "Song generation timed out upstream");
+		assert.doesNotMatch(rows[1].error_message, /CANARY_LEAK_TOKEN_99/);
+
+		assert.equal(rows[2].status, -4);
+		assert.equal(rows[2].error_message, "Song generation rejected by content policy");
+		assert.doesNotMatch(rows[2].error_message, /CANARY_PRIVATE_EMAIL/);
+
+		// 404 and explicit { success: true, data: null } preserve legacy pending rows without bogus identify_id
+		assert.deepEqual(rows[3], { music_id: "m_404", status: 0, audio: null, service: "aisonggenerator" });
+		assert.equal("identify_id" in rows[3], false);
+		assert.deepEqual(rows[4], { music_id: "m_explicit_null", status: 0, audio: null, service: "aisonggenerator" });
+
+		// 502 outage, empty HTTP 200 body, omitted data ({ success: true }), 200 { success: false }, and unrecognized envelopes all surface as 502 read errors
+		for (const id of ["m_outage", "m_empty_200", "m_omitted_data", "m_app_false", "m_weird_envelope"]) {
+			await assert.rejects(
+				() => aisgMod.getAiSongGeneratorSongResults([id], { AISONGGENERATOR_SESSION_TOKEN: "tok" }),
+				(err) => {
+					assert.equal(err.status, 502, `expected 502 for ${id}`);
+					assert.equal(err.code, "aisg_upstream_error", `expected aisg_upstream_error for ${id}`);
+					assert.equal(err.retryable, true);
+					assert.equal(err.outcome, "rejected");
+					return true;
+				}
+			);
+		}
 	} finally {
 		globalThis.fetch = origFetch;
 	}

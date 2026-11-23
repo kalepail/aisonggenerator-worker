@@ -52,7 +52,3 @@ interface AiModels {
 		postProcessedOutputs: ChatCompletionOutput;
 	};
 }
-
-interface Env {
-	AISONGGENERATOR_WORKSPACE_ID?: string;
-}

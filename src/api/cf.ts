@@ -1,8 +1,9 @@
-import { hasUnexpectedChinese } from "./language";
+import { isTimeoutError } from './errors';
+import { hasUnexpectedChinese } from './language';
 
-export const PRIMARY_LYRICS_MODEL = "@cf/zai-org/glm-5.3";
-export const SECONDARY_LYRICS_MODEL = "@cf/deepseek-ai/deepseek-v4.1-flash-1017";
-export const FALLBACK_LYRICS_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+export const PRIMARY_LYRICS_MODEL = '@cf/zai-org/glm-5.3';
+export const SECONDARY_LYRICS_MODEL = '@cf/deepseek-ai/deepseek-v4.1-flash-1017';
+export const FALLBACK_LYRICS_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 
 export const SONGWRITER_SYSTEM_PROMPT = `You are a skilled, versatile songwriter and music producer writing songs for an AI music generator.
 
@@ -32,17 +33,35 @@ export interface SongWriteResult {
 	style: string[];
 }
 
+type CfLyricsFailureReason =
+	| 'invalid_json'
+	| 'invalid_schema'
+	| 'insufficient_style_tags'
+	| 'unexpected_chinese'
+	| 'timeout'
+	| 'binding_error';
+
+class CfLyricsValidationError extends Error {
+	readonly reason: CfLyricsFailureReason;
+
+	constructor(message: string, reason: CfLyricsFailureReason) {
+		super(message);
+		this.name = 'CfLyricsValidationError';
+		this.reason = reason;
+	}
+}
+
 export function extractModelDraft(result: unknown): unknown {
-	if (!result || typeof result !== "object") {
+	if (!result || typeof result !== 'object') {
 		return undefined;
 	}
 	const envelope = (result as { result?: unknown }).result;
-	const source = (envelope && typeof envelope === "object" ? envelope : result) as {
+	const source = (envelope && typeof envelope === 'object' ? envelope : result) as {
 		response?: unknown;
 		choices?: Array<{ message?: { content?: unknown } }>;
 	};
 	const choiceContent = source.choices?.[0]?.message?.content;
-	if (typeof choiceContent === "string" && choiceContent.trim()) {
+	if (typeof choiceContent === 'string' && choiceContent.trim()) {
 		return choiceContent;
 	}
 	if (source.response !== undefined) {
@@ -53,35 +72,35 @@ export function extractModelDraft(result: unknown): unknown {
 
 export function parseAndValidateSong(raw: unknown, prompt: string): SongWriteResult {
 	let draft = raw;
-	if (typeof draft === "string") {
-		const cleaned = draft.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+	if (typeof draft === 'string') {
+		const cleaned = draft.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
 		try {
 			draft = JSON.parse(cleaned);
 		} catch {
-			const start = cleaned.indexOf("{");
-			const end = cleaned.lastIndexOf("}");
+			const start = cleaned.indexOf('{');
+			const end = cleaned.lastIndexOf('}');
 			if (start >= 0 && end > start) {
 				try {
 					draft = JSON.parse(cleaned.slice(start, end + 1));
 				} catch {
-					throw new Error("Cloudflare AI returned invalid JSON");
+					throw new CfLyricsValidationError('Cloudflare AI returned invalid JSON', 'invalid_json');
 				}
 			} else {
-				throw new Error("Cloudflare AI returned invalid JSON");
+				throw new CfLyricsValidationError('Cloudflare AI returned invalid JSON', 'invalid_json');
 			}
 		}
 	}
 
 	const song = draft as { title?: unknown; lyrics?: unknown; style?: unknown } | null;
 	if (
-		typeof song?.title !== "string" ||
+		typeof song?.title !== 'string' ||
 		!song.title.trim() ||
-		typeof song.lyrics !== "string" ||
+		typeof song.lyrics !== 'string' ||
 		!song.lyrics.trim() ||
 		!Array.isArray(song.style) ||
-		!song.style.every((tag) => typeof tag === "string")
+		!song.style.every((tag) => typeof tag === 'string')
 	) {
-		throw new Error("Cloudflare AI response does not match the lyrics schema");
+		throw new CfLyricsValidationError('Cloudflare AI response does not match the lyrics schema', 'invalid_schema');
 	}
 
 	const normalized: SongWriteResult = {
@@ -91,11 +110,14 @@ export function parseAndValidateSong(raw: unknown, prompt: string): SongWriteRes
 	};
 
 	if (normalized.style.length < 2) {
-		throw new Error("Cloudflare AI response returned fewer than 2 style tags");
+		throw new CfLyricsValidationError(
+			'Cloudflare AI response returned fewer than 2 style tags',
+			'insufficient_style_tags'
+		);
 	}
 
 	if (hasUnexpectedChinese(prompt, normalized)) {
-		throw new Error("Cloudflare AI returned unexpected Chinese output");
+		throw new CfLyricsValidationError('Cloudflare AI returned unexpected Chinese output', 'unexpected_chinese');
 	}
 
 	return normalized;
@@ -104,13 +126,13 @@ export function parseAndValidateSong(raw: unknown, prompt: string): SongWriteRes
 async function runGlm53(env: Env, prompt: string): Promise<SongWriteResult> {
 	const result = await env.AI.run(PRIMARY_LYRICS_MODEL, {
 		messages: [
-			{ role: "system", content: SONGWRITER_SYSTEM_PROMPT },
-			{ role: "user", content: prompt },
+			{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
+			{ role: 'user', content: prompt },
 		],
 		max_completion_tokens: 2600,
 		temperature: 0.75,
-		reasoning_effort: "low",
-		response_format: { type: "json_object" },
+		reasoning_effort: 'low',
+		response_format: { type: 'json_object' },
 	});
 
 	return parseAndValidateSong(extractModelDraft(result), prompt);
@@ -119,13 +141,13 @@ async function runGlm53(env: Env, prompt: string): Promise<SongWriteResult> {
 async function runDeepSeekFlash(env: Env, prompt: string): Promise<SongWriteResult> {
 	const result = await env.AI.run(SECONDARY_LYRICS_MODEL, {
 		messages: [
-			{ role: "system", content: SONGWRITER_SYSTEM_PROMPT },
-			{ role: "user", content: prompt },
+			{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
+			{ role: 'user', content: prompt },
 		],
 		max_completion_tokens: 1600,
 		temperature: 0.75,
-		reasoning_effort: "none",
-		response_format: { type: "json_object" },
+		reasoning_effort: 'none',
+		response_format: { type: 'json_object' },
 	});
 
 	return parseAndValidateSong(extractModelDraft(result), prompt);
@@ -134,24 +156,24 @@ async function runDeepSeekFlash(env: Env, prompt: string): Promise<SongWriteResu
 async function runLlama33Fallback(env: Env, prompt: string): Promise<SongWriteResult> {
 	const result = await env.AI.run(FALLBACK_LYRICS_MODEL, {
 		messages: [
-			{ role: "system", content: SONGWRITER_SYSTEM_PROMPT },
-			{ role: "user", content: prompt },
+			{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
+			{ role: 'user', content: prompt },
 		],
 		max_tokens: 1400,
 		temperature: 0.75,
 		response_format: {
-			type: "json_schema",
+			type: 'json_schema',
 			json_schema: {
-				type: "object",
+				type: 'object',
 				properties: {
-					title: { type: "string" },
-					lyrics: { type: "string" },
+					title: { type: 'string' },
+					lyrics: { type: 'string' },
 					style: {
-						type: "array",
-						items: { type: "string" },
+						type: 'array',
+						items: { type: 'string' },
 					},
 				},
-				required: ["title", "lyrics", "style"],
+				required: ['title', 'lyrics', 'style'],
 			},
 		},
 	});
@@ -165,16 +187,30 @@ const cfLyricsRunners: Array<{ model: string; run: (env: Env, prompt: string) =>
 	{ model: FALLBACK_LYRICS_MODEL, run: runLlama33Fallback },
 ];
 
+function classifyCfFailureReason(error: unknown): CfLyricsFailureReason {
+	if (error instanceof CfLyricsValidationError) {
+		return error.reason;
+	}
+	if (isTimeoutError(error)) {
+		return 'timeout';
+	}
+	return 'binding_error';
+}
+
 export async function songWrite(env: Env, prompt: string): Promise<SongWriteResult> {
-	const errors: string[] = [];
 	for (const runner of cfLyricsRunners) {
 		try {
 			return await runner.run(env, prompt);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			console.warn(`CF AI lyrics model (${runner.model}) failed: ${message}`);
-			errors.push(`${runner.model}: ${message}`);
+			const reason = classifyCfFailureReason(error);
+			console.warn(
+				JSON.stringify({
+					event: 'cf_ai_lyrics_failed',
+					model: runner.model,
+					reason,
+				})
+			);
 		}
 	}
-	throw new Error(`All Cloudflare AI lyrics models failed: ${errors.join("; ")}`);
+	throw new Error('All Cloudflare AI lyrics models failed');
 }
