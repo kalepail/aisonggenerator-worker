@@ -29,11 +29,12 @@ interface LyricsResponse {
     description?: string; // Additional description to append to prompt for instrumentals
     public: boolean;
     model?: string;
-    // These were in original but seem specific to aisonggenerator or not universally applicable
-    // lyrics_mode?: boolean;
-    // type?: "desc" | "lyrics";
-    // user_id?: string;
-    // user_email?: string;
+    vocalGender?: "m" | "f";
+    negativeTags?: string;
+    is_original?: boolean;
+    lyrics_compatibility_level?: 0 | 1 | 2 | 3;
+    imageUrls?: string[];
+    workspace_id?: string;
 }
 
 export async function getSongs(ctx: Context<{ Bindings: Env }>) {
@@ -82,6 +83,7 @@ export async function postSongs(ctx: Context<{ Bindings: Env }>) {
 
     try {
         if (source === 'aisonggenerator') {
+            const compatibilityLevel = data.lyrics_compatibility_level;
             const params: AiSongGeneratorGenerateParams = {
                 title: data.title,
                 styles: data.style, // Ensure this is an array of strings
@@ -89,6 +91,15 @@ export async function postSongs(ctx: Context<{ Bindings: Env }>) {
                 lyrics: data.lyrics,
                 description: data.instrumental ? instrumentalDesc : data.lyrics, // Use combinedDesc for instrumental prompt
                 isPublic: data.public,
+                vocalGender: data.vocalGender === 'm' || data.vocalGender === 'f' ? data.vocalGender : undefined,
+                negativeTags: typeof data.negativeTags === 'string' ? data.negativeTags : undefined,
+                isOriginal: typeof data.is_original === 'boolean' ? data.is_original : undefined,
+                lyricsCompatibilityLevel:
+                    compatibilityLevel === 0 || compatibilityLevel === 1 || compatibilityLevel === 2 || compatibilityLevel === 3
+                        ? compatibilityLevel
+                        : undefined,
+                imageUrls: Array.isArray(data.imageUrls) ? data.imageUrls : undefined,
+                workspaceId: typeof data.workspace_id === 'string' ? data.workspace_id : undefined,
             };
             taskIds = await generateAiSongGeneratorSong(params, env);
             return ctx.json(taskIds); // aisonggenerator returns task_id(s)

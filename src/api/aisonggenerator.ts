@@ -6,6 +6,12 @@ export interface AiSongGeneratorGenerateParams {
     lyrics?: string; // For lyrical mode
     description?: string; // For instrumental mode (maps to description)
     isPublic: boolean; // True if public, false if private
+    vocalGender?: 'm' | 'f'; // Optional vocal gender hint (custom mode, 0 extra credits)
+    negativeTags?: string; // Optional styles to exclude (max 200 chars, 0 extra credits)
+    isOriginal?: boolean; // Optional declaration of original lyrics (custom mode, 0 extra credits)
+    lyricsCompatibilityLevel?: 0 | 1 | 2 | 3; // Optional copyright false-positive shield (custom non-instrumental mode, 1-3)
+    imageUrls?: string[]; // Optional reference image URLs for v6 easy mode (max 5 https URLs)
+    workspaceId?: string; // Optional AISG workspace folder id (falls back to env.AISONGGENERATOR_WORKSPACE_ID)
 }
 
 // Song row returned to smol-workflow.
@@ -17,17 +23,43 @@ export interface AiSongGeneratorSong {
     audio: string | null;
     service: 'aisonggenerator';
     identify_id?: string; // Provider task id for this generation
+    duration?: number; // Audio duration in seconds when reported
+    provider?: string; // Upstream audio backend reported by AISG (e.g. "sun", "kie")
+    credits_cost?: number;
+    credits_refunded?: boolean;
+    error_message?: string; // Clamped upstream failure reason when status < 0
+}
+
+// Strictly non-PII credit & subscription snapshot from POST /api/user.
+export interface AisgCredits {
+    left_credits: number;
+    paid_credits: number;
+    used_credits: number;
+    free_credits: number;
+    plan_tier: string | null;
+    has_active_sub: boolean;
 }
 
 // Site default in the create page. The label in the UI is "V4". The API value is "v6".
-const MUSIC_MODEL = 'v6';
-const EASY_PROMPT_LIMIT = 3000;
-const STYLE_LIMIT = 1000;
+export const MUSIC_MODEL = 'v6';
+export const TITLE_LIMIT = 80;
+export const CUSTOM_LYRICS_LIMIT = 5000;
+export const EASY_PROMPT_LIMIT = 3000;
+export const STYLE_LIMIT = 1000;
+export const NEGATIVE_TAGS_LIMIT = 200;
+export const MAX_IMAGE_URLS = 5;
+export const LOW_CREDITS_THRESHOLD = 500;
+export const MIN_TASK_CREDITS = 4;
+export const SESSION_EXPIRY_WARN_HOURS = 48;
+
+const ERROR_MESSAGE_LIMIT = 200;
 const ORIGIN = 'https://aisonggenerator.io';
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 interface SubmitResponse {
     success?: boolean;
+    message?: string;
+    code?: string | number;
     data?: {
         task_id?: string;
     };
@@ -38,7 +70,18 @@ interface MusicItem {
     task_id?: string;
     status?: string;
     audio_url?: string | null;
+    processing_results?: {
+        audio_source?: {
+            url?: string | null;
+            format?: string | null;
+        } | null;
+    } | null;
+    duration?: number | null;
     created_at?: string;
+    provider?: string;
+    credits_cost?: number;
+    credits_refunded?: boolean;
+    error_message?: string | null;
 }
 
 interface MusicListResponse {
@@ -55,6 +98,27 @@ interface MusicListResponse {
 interface MusicDetailResponse {
     success?: boolean;
     data?: MusicItem;
+}
+
+interface UserProfileResponse {
+    success?: boolean;
+    data?: {
+        left_credits?: unknown;
+        paid_credits?: unknown;
+        used_credits?: unknown;
+        free_credits?: unknown;
+        plan_tier?: unknown;
+        has_active_sub?: unknown;
+    };
+}
+
+interface StyleOptimizeResponse {
+    result?: unknown;
+    error?: unknown;
+}
+
+interface AudioRecoveryResponse {
+    success?: boolean;
 }
 
 function sessionCookie(env: Env): string {
@@ -102,6 +166,76 @@ function audioUrl(value: string | null | undefined): string | null {
     return null;
 }
 
+function clampString(value: string | undefined | null, limit: number): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+    return trimmed.slice(0, limit);
+}
+
+function sanitizeErrorMessage(value: string | null | undefined): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+        return undefined;
+    }
+    return normalized.slice(0, ERROR_MESSAGE_LIMIT);
+}
+
+function sanitizeImageUrls(urls: string[] | undefined): string[] {
+    if (!Array.isArray(urls)) {
+        return [];
+    }
+    const valid: string[] = [];
+    for (const raw of urls) {
+        if (typeof raw !== 'string') {
+            continue;
+        }
+        const trimmed = raw.trim();
+        if (!trimmed) {
+            continue;
+        }
+        try {
+            const parsed = new URL(trimmed);
+            if (parsed.protocol === 'https:') {
+                valid.push(parsed.toString());
+            }
+        } catch {
+            // Skip invalid URLs
+        }
+        if (valid.length >= MAX_IMAGE_URLS) {
+            break;
+        }
+    }
+    return valid;
+}
+
+function normalizeCompatibilityLevel(value: unknown): 1 | 2 | 3 | undefined {
+    if (value === 1 || value === 2 || value === 3) {
+        return value;
+    }
+    return undefined;
+}
+
+function finiteNumber(value: unknown, fallback = 0): number {
+    return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function isInsufficientCredits(status: number, json: SubmitResponse | null): boolean {
+    if (status === 402) {
+        return true;
+    }
+    const message = typeof json?.message === 'string' ? json.message : '';
+    const code = typeof json?.code === 'string' ? json.code : '';
+    return /insufficient\s*credit|not\s+enough\s+credit|out\s+of\s+credit/i.test(`${message} ${code}`);
+}
+
 async function readJson<T>(response: Response): Promise<T | null> {
     const text = await response.text();
     if (!text) {
@@ -114,42 +248,97 @@ async function readJson<T>(response: Response): Promise<T | null> {
     }
 }
 
-function buildSubmitBody(params: AiSongGeneratorGenerateParams): Record<string, unknown> {
-    const title = params.title?.trim() || undefined;
+export function resolveWorkspaceId(
+    params?: Pick<AiSongGeneratorGenerateParams, 'workspaceId'>,
+    env?: Partial<Env>
+): string | undefined {
+    const candidate = params?.workspaceId?.trim() || env?.AISONGGENERATOR_WORKSPACE_ID?.trim();
+    return candidate || undefined;
+}
+
+export function buildSubmitBody(
+    params: AiSongGeneratorGenerateParams,
+    env?: Partial<Env>
+): Record<string, unknown> {
+    const title = clampString(params.title, TITLE_LIMIT);
+    const workspaceId = resolveWorkspaceId(params, env);
 
     if (params.instrumental) {
-        const prompt = (params.description || '').trim().slice(0, EASY_PROMPT_LIMIT);
+        const prompt = clampString(params.description, EASY_PROMPT_LIMIT);
         if (!prompt) {
             throw new Error('Instrumental prompt is empty');
         }
-        return {
+        const imageUrls = sanitizeImageUrls(params.imageUrls);
+        const body: Record<string, unknown> = {
             prompt,
             model: MUSIC_MODEL,
             customMode: false,
             instrumental: true,
             is_private: !params.isPublic,
-            title,
         };
+        if (imageUrls.length > 0) {
+            body.imageUrls = imageUrls;
+        }
+        if (title) {
+            body.title = title;
+        }
+        if (workspaceId) {
+            body.workspace_id = workspaceId;
+        }
+        return body;
     }
 
-    const prompt = (params.lyrics || '').trim();
+    const prompt = clampString(params.lyrics, CUSTOM_LYRICS_LIMIT);
     if (!prompt) {
         throw new Error('Lyrics prompt is empty');
     }
-    const style = params.styles.map(style => style.trim()).filter(Boolean).join(', ').slice(0, STYLE_LIMIT);
-    return {
+    const style = clampString(
+        params.styles.map(item => item.trim()).filter(Boolean).join(', '),
+        STYLE_LIMIT
+    );
+    const body: Record<string, unknown> = {
         prompt,
         model: MUSIC_MODEL,
         customMode: true,
         instrumental: false,
         is_private: !params.isPublic,
-        title,
-        style: style || undefined,
     };
+    if (title) {
+        body.title = title;
+    }
+    if (style) {
+        body.style = style;
+    }
+    if (params.vocalGender === 'm' || params.vocalGender === 'f') {
+        body.vocalGender = params.vocalGender;
+    }
+    const negativeTags = clampString(params.negativeTags, NEGATIVE_TAGS_LIMIT);
+    if (negativeTags) {
+        body.negativeTags = negativeTags;
+    }
+    if (typeof params.isOriginal === 'boolean') {
+        body.is_original = params.isOriginal;
+    }
+    const compatibilityLevel = normalizeCompatibilityLevel(params.lyricsCompatibilityLevel);
+    if (compatibilityLevel) {
+        body.lyrics_compatibility_level = compatibilityLevel;
+    }
+    if (workspaceId) {
+        body.workspace_id = workspaceId;
+    }
+    return body;
 }
 
-async function listMusic(env: Env, page: number): Promise<MusicListResponse> {
-    const response = await fetch(`${ORIGIN}/api/music/list?scope=library&page=${page}`, {
+async function listMusic(env: Env, page: number, workspaceId?: string): Promise<MusicListResponse> {
+    const query = new URLSearchParams({
+        scope: 'library',
+        page: String(page),
+    });
+    if (workspaceId) {
+        query.set('workspace_id', workspaceId);
+    }
+
+    const response = await fetch(`${ORIGIN}/api/music/list?${query.toString()}`, {
         method: 'GET',
         headers: aisgAuthHeaders(env),
         signal: AbortSignal.timeout(10000),
@@ -161,7 +350,7 @@ async function listMusic(env: Env, page: number): Promise<MusicListResponse> {
     return json;
 }
 
-async function findMusicIds(env: Env, taskId: string): Promise<string[]> {
+async function findMusicIds(env: Env, taskId: string, workspaceId?: string): Promise<string[]> {
     let found: MusicItem[] = [];
 
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -169,7 +358,7 @@ async function findMusicIds(env: Env, taskId: string): Promise<string[]> {
             await new Promise(resolve => setTimeout(resolve, 800));
         }
 
-        const page = await listMusic(env, 1);
+        const page = await listMusic(env, 1, workspaceId);
         found = (page.data?.items || []).filter(item => item.task_id === taskId && item.music_id);
         if (found.length >= 2) {
             break;
@@ -189,6 +378,87 @@ async function findMusicIds(env: Env, taskId: string): Promise<string[]> {
 }
 
 /**
+ * Fetches the current AISG credit balance and subscription status via bodyless POST /api/user (0 credits).
+ * Extracts strictly non-PII fields.
+ */
+export async function getAisgCredits(env: Env): Promise<AisgCredits> {
+    const response = await fetch(`${ORIGIN}/api/user`, {
+        method: 'POST',
+        headers: aisgAuthHeaders(env),
+        signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+        throw new Error(`AISG credits check failed (HTTP ${response.status})`);
+    }
+
+    const json = await readJson<UserProfileResponse>(response);
+    const data = json?.data;
+    if (!data || typeof data.left_credits !== 'number' || !Number.isFinite(data.left_credits)) {
+        throw new Error('AISG credits check returned invalid credit payload');
+    }
+
+    return {
+        left_credits: data.left_credits,
+        paid_credits: finiteNumber(data.paid_credits),
+        used_credits: finiteNumber(data.used_credits),
+        free_credits: finiteNumber(data.free_credits),
+        plan_tier: typeof data.plan_tier === 'string' && data.plan_tier.trim() ? data.plan_tier.trim() : null,
+        has_active_sub: Boolean(data.has_active_sub),
+    };
+}
+
+/**
+ * Enhances a style prompt using AISG's free (0-credit) style optimizer.
+ */
+export async function optimizeAisgStyle(content: string, env: Env): Promise<string> {
+    const input = clampString(content, STYLE_LIMIT);
+    if (!input) {
+        throw new Error('Style content is empty');
+    }
+
+    const response = await fetch(`${ORIGIN}/api/music/style/optimize`, {
+        method: 'POST',
+        headers: aisgAuthHeaders(env, true),
+        body: JSON.stringify({ content: input }),
+        signal: AbortSignal.timeout(10000),
+    });
+
+    const json = await readJson<StyleOptimizeResponse>(response);
+    if (!response.ok) {
+        throw new Error(`AISG style optimize failed (HTTP ${response.status})`);
+    }
+
+    const optimized = typeof json?.result === 'string' ? clampString(json.result, STYLE_LIMIT) : undefined;
+    if (!optimized) {
+        throw new Error('AISG style optimize returned empty result');
+    }
+    return optimized;
+}
+
+/**
+ * Requests free (0-credit) upstream audio recovery for a stalled or missing-audio AISG song.
+ */
+export async function recoverAisgAudio(musicId: string, env: Env): Promise<boolean> {
+    const trimmedId = musicId.trim();
+    if (!trimmedId) {
+        throw new Error('Music id is required for audio recovery');
+    }
+
+    const response = await fetch(`${ORIGIN}/api/music/${encodeURIComponent(trimmedId)}/audio/recovery`, {
+        method: 'POST',
+        headers: aisgAuthHeaders(env),
+        signal: AbortSignal.timeout(10000),
+    });
+
+    const json = await readJson<AudioRecoveryResponse>(response);
+    if (!response.ok || json?.success === false) {
+        throw new Error(`AISG audio recovery failed (HTTP ${response.status})`);
+    }
+    return true;
+}
+
+/**
  * Generates a song using the aisonggenerator.io service.
  * @param params Parameters for song generation.
  * @param env Environment bindings.
@@ -198,18 +468,23 @@ export async function generateAiSongGeneratorSong(
     params: AiSongGeneratorGenerateParams,
     env: Env
 ): Promise<string[]> {
+    const workspaceId = resolveWorkspaceId(params, env);
     const response = await fetch(`${ORIGIN}/api/music/submit`, {
         method: 'POST',
         headers: aisgAuthHeaders(env, true),
-        body: JSON.stringify(buildSubmitBody(params)),
+        body: JSON.stringify(buildSubmitBody(params, env)),
+        signal: AbortSignal.timeout(15000),
     });
 
     const json = await readJson<SubmitResponse>(response);
     if (!response.ok || !json?.success || !json.data?.task_id) {
+        if (isInsufficientCredits(response.status, json)) {
+            throw new Error(`AISG song submission failed: insufficient credits (HTTP ${response.status})`);
+        }
         throw new Error(`AISG song submission failed (HTTP ${response.status})`);
     }
 
-    return findMusicIds(env, json.data.task_id);
+    return findMusicIds(env, json.data.task_id, workspaceId);
 }
 
 /**
@@ -261,13 +536,35 @@ export async function getAiSongGeneratorSongResults(
             };
         }
 
-        const audio = audioUrl(data.audio_url);
-        return {
+        const audio = audioUrl(data.audio_url) ?? audioUrl(data.processing_results?.audio_source?.url);
+        const status = mapStatus(data.status, audio !== null);
+        const row: AiSongGeneratorSong = {
             music_id: data.music_id || id,
-            status: mapStatus(data.status, audio !== null),
+            status,
             audio,
             identify_id: data.task_id,
             service: 'aisonggenerator' as const,
         };
+
+        if (typeof data.duration === 'number' && Number.isFinite(data.duration) && data.duration > 0) {
+            row.duration = data.duration;
+        }
+        if (typeof data.provider === 'string' && data.provider.trim()) {
+            row.provider = data.provider.trim();
+        }
+        if (typeof data.credits_cost === 'number' && Number.isFinite(data.credits_cost)) {
+            row.credits_cost = data.credits_cost;
+        }
+        if (typeof data.credits_refunded === 'boolean') {
+            row.credits_refunded = data.credits_refunded;
+        }
+        if (status < 0) {
+            const errorMessage = sanitizeErrorMessage(data.error_message);
+            if (errorMessage) {
+                row.error_message = errorMessage;
+            }
+        }
+
+        return row;
     });
 }
