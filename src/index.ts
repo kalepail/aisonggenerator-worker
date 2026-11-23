@@ -1,5 +1,4 @@
 import { Hono, Context } from 'hono';
-import { cors } from 'hono/cors';
 import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import {
@@ -117,7 +116,6 @@ async function health(ctx: Context<{ Bindings: Env }>) {
 export const app = new Hono<{ Bindings: Env }>();
 
 app
-	.all('*', cors())
 	.get('/health', health)
 	.post('/api/lyrics', lyrics)
 	.post('/api/tasks', postTask)
@@ -221,22 +219,15 @@ export default {
 	async scheduled(ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
 		const stub = getProviderStateStub(env);
 
-		await Promise.all([
-			checkSession(
-				'AISG',
-				() => stub.checkAisgSession(),
-				(credits) => ({
-					left_credits: credits.left_credits,
-					plan_tier: credits.plan_tier,
-					has_active_sub: credits.has_active_sub,
-					session_expires_at: credits.session_expires_at,
-				})
-			),
-			checkSession(
-				'DiffRhythm',
-				() => stub.refreshDiffrhythmSessionIfConfigured(),
-				(refreshed) => (refreshed ? { refreshed: true } : null)
-			),
-		]);
+		await checkSession(
+			'AISG',
+			() => stub.checkAisgSession(),
+			(credits) => ({
+				left_credits: credits.left_credits,
+				plan_tier: credits.plan_tier,
+				has_active_sub: credits.has_active_sub,
+				session_expires_at: credits.session_expires_at,
+			})
+		);
 	},
 };

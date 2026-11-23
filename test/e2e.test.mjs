@@ -257,7 +257,7 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 	const origFetch = globalThis.fetch;
 	const origSetTimeout = globalThis.setTimeout;
 	const origDateNow = Date.now;
-	const env = createEnv({ DIFFRHYTHM_SESSION_COOKIE: "diff-cookie-tok" });
+	const env = createEnv();
 
 	globalThis.setTimeout = (fn, _ms, ...args) => origSetTimeout(fn, 0, ...args);
 
@@ -523,133 +523,61 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 		assert.equal(deepSubmits, 1);
 		assert.equal(deepPage1Reads, 2);
 
-		// 5) Step-2 legacy DiffRhythm bridge works AND unreadable 2xx DiffRhythm submit maps to outcome: 'unknown'!
-		let diffCreateCount = 0;
-		globalThis.fetch = async (url, init = {}) => {
-			const urlStr = String(url);
-			if (urlStr === "https://aisinging.ai/api/auth/session") {
-				return Response.json({ user: { id: "diff_user" } });
-			}
-			if (urlStr === "https://aisinging.ai/api/user/info") {
-				return Response.json({ data: { credits: 50 } });
-			}
-			if (urlStr === "https://aisinging.ai/api/app/tasks" && init.method === "POST") {
-				diffCreateCount++;
-				return Response.json({ data: { taskId: `diff_task_${diffCreateCount}` } });
-			}
-			if (urlStr.startsWith("https://aisinging.ai/api/app/tasks?")) {
-				return Response.json({
-					data: {
-						items: [
-							{ _id: "diff_task_1", status: 1, outputs: [{ url: "https://cdn.diff/1.mp3" }] },
-							{ _id: "diff_task_2", status: 1, outputs: [{ url: "https://cdn.diff/2.mp3" }] },
-						],
-					},
-				});
-			}
-			throw new Error(`Unexpected DiffRhythm URL: ${urlStr}`);
-		};
-
-		const diffSubmitRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs?source=diffrhythm", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					title: "Bridge Song",
-					style: ["synthpop", "dreamy"],
-					instrumental: false,
-					lyrics: "[Verse 1]\nStill draining",
-					public: true,
-				}),
-			}),
-			env
-		);
-		assert.equal(diffSubmitRes.status, 200);
-		assert.deepEqual(await diffSubmitRes.json(), ["diff_task_1", "diff_task_2"]);
-
-		const diffPollRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs?source=diffrhythm&ids=diff_task_1,diff_task_2"),
-			env
-		);
-		assert.equal(diffPollRes.status, 200);
-		assert.equal((await diffPollRes.json())[0].status, 4);
-
-		// Unreadable 200 DiffRhythm submit -> 502 aisg_dispatch_unknown (retryable: false, outcome: 'unknown')
-		globalThis.fetch = async (url, init = {}) => {
-			const urlStr = String(url);
-			if (urlStr === "https://aisinging.ai/api/auth/session") return Response.json({ user: { id: "u" } });
-			if (urlStr === "https://aisinging.ai/api/user/info") return Response.json({ data: { credits: 50 } });
-			if (urlStr === "https://aisinging.ai/api/app/tasks" && init.method === "POST") {
-				return new Response("{truncated", { status: 200 });
-			}
-			throw new Error(`Unexpected URL: ${urlStr}`);
-		};
-		const diffUnreadableRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs?source=diffrhythm", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: keyedPayload,
-			}),
-			env
-		);
-		assert.equal(diffUnreadableRes.status, 502);
-		const diffUnreadableBody = await diffUnreadableRes.json();
-		assert.equal(diffUnreadableBody.code, "aisg_dispatch_unknown");
-		assert.equal(diffUnreadableBody.retryable, false);
-		assert.equal(diffUnreadableBody.outcome, "unknown");
-
-		// 6) Input guardrails reject before upstream calls (including keyed DiffRhythm!)
+		// 5) Step-6 contraction: DiffRhythm, Suno, malformed inputs, and wildcard CORS are all rejected/absent
 		let unexpectedCalls = 0;
 		globalThis.fetch = async () => {
 			unexpectedCalls++;
 			throw new Error("Should not call upstream on invalid inputs");
 		};
-		const keyedDiffRes = await workerMod.default.fetch(
+		for (const req of [
 			new Request("http://aisonggenerator-worker/api/songs?source=diffrhythm", {
 				method: "POST",
-				headers: { "Content-Type": "application/json", "Idempotency-Key": "diff-keyed-attempt-0001" },
+				headers: { "Content-Type": "application/json" },
 				body: keyedPayload,
+			}),
+			new Request("http://aisonggenerator-worker/api/songs?source=diffrhythm&ids=diff_task_1,diff_task_2"),
+			new Request("http://aisonggenerator-worker/api/tasks?source=diffrhythm", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: keyedPayload,
+			}),
+			new Request("http://aisonggenerator-worker/api/tasks/task_1?source=diffrhythm"),
+			new Request("http://aisonggenerator-worker/api/songs?source=suno&ids=a,b"),
+			new Request("http://aisonggenerator-worker/api/songs?ids=a,,"),
+			new Request("http://aisonggenerator-worker/api/tasks", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: "{not valid json",
+			}),
+		]) {
+			const res = await workerMod.default.fetch(req, env);
+			assert.equal(res.status, 400, `expected 400 for ${req.method} ${req.url}`);
+			assert.equal((await res.json()).code, "invalid_request");
+		}
+		assert.equal(unexpectedCalls, 0);
+
+		// Internal Service-Binding-only: wildcard CORS middleware removed
+		const corsProbeRes = await workerMod.default.fetch(
+			new Request("http://aisonggenerator-worker/health", {
+				headers: { Origin: "https://evil.example" },
 			}),
 			env
 		);
-		assert.equal(keyedDiffRes.status, 400);
-		assert.equal((await keyedDiffRes.json()).code, "invalid_request");
-		assert.equal(
-			(
-				await workerMod.default.fetch(
-					new Request("http://aisonggenerator-worker/api/tasks?source=diffrhythm", {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: keyedPayload,
-					}),
-					env
-				)
-			).status,
-			400
+		assert.equal(corsProbeRes.status, 200);
+		assert.equal(corsProbeRes.headers.get("access-control-allow-origin"), null);
+
+		const preflightRes = await workerMod.default.fetch(
+			new Request("http://aisonggenerator-worker/api/tasks", {
+				method: "OPTIONS",
+				headers: {
+					Origin: "https://evil.example",
+					"Access-Control-Request-Method": "POST",
+				},
+			}),
+			env
 		);
-		assert.equal(
-			(await workerMod.default.fetch(new Request("http://aisonggenerator-worker/api/songs?source=suno&ids=a,b"), env))
-				.status,
-			400
-		);
-		assert.equal(
-			(await workerMod.default.fetch(new Request("http://aisonggenerator-worker/api/songs?ids=a,,"), env)).status,
-			400
-		);
-		assert.equal(
-			(
-				await workerMod.default.fetch(
-					new Request("http://aisonggenerator-worker/api/tasks", {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: "{not valid json",
-					}),
-					env
-				)
-			).status,
-			400
-		);
-		assert.equal(unexpectedCalls, 0);
+		assert.equal(preflightRes.status, 404);
+		assert.equal(preflightRes.headers.get("access-control-allow-origin"), null);
 	} finally {
 		globalThis.fetch = origFetch;
 		globalThis.setTimeout = origSetTimeout;
@@ -902,7 +830,7 @@ test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, 
 	}
 });
 
-test("E2E scheduled() cron, DO state/session_token preservation, 0-credit GET /health, and closed-set error categories (no custom error.name leaks)", async () => {
+test("E2E scheduled() cron retires legacy session_token safely, preserves aisg_credits, 0-credit GET /health, and closed-set error categories (no custom error.name leaks)", async () => {
 	const origFetch = globalThis.fetch;
 	const env = createEnv();
 
@@ -958,14 +886,14 @@ test("E2E scheduled() cron, DO state/session_token preservation, 0-credit GET /h
 					},
 				});
 			}
-			if (urlStr === "https://aisinging.ai/api/auth/session") return Response.json({ user: { id: "diff_u" } });
-			if (urlStr === "https://aisinging.ai/api/user/info") return Response.json({ data: { credits: 100 } });
 			throw new Error(`Unexpected cron URL: ${urlStr}`);
 		};
 
 		await workerMod.default.scheduled({}, env, {});
-		assert.equal(doStore.has("session_token"), true);
+		// Step-6 contraction: obsolete DiffRhythm key is safely retired while aisg_credits & aisg_health stay intact
+		assert.equal(doStore.has("session_token"), false);
 		assert.ok(doStore.has("aisg_credits"));
+		assert.ok(doStore.has("aisg_health"));
 
 		globalThis.fetch = async () => {
 			throw new Error("GET /health must never make upstream calls");
@@ -991,9 +919,6 @@ test("E2E scheduled() cron, DO state/session_token preservation, 0-credit GET /h
 						throw new Error(`Stream exploded: ${streamCanary}`);
 					},
 				};
-			}
-			if (urlStr.startsWith("https://aisinging.ai/")) {
-				return Response.json({ user: { id: "diff_u" }, data: { credits: 100 } });
 			}
 			throw new Error(`Unexpected URL: ${urlStr}`);
 		};
@@ -1026,9 +951,6 @@ test("E2E scheduled() cron, DO state/session_token preservation, 0-credit GET /h
 					throw makeCanaryError();
 				},
 				checkAisgSession: async () => {
-					throw makeCanaryError();
-				},
-				refreshDiffrhythmSessionIfConfigured: async () => {
 					throw makeCanaryError();
 				},
 			}),

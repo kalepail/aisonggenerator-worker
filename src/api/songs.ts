@@ -9,12 +9,6 @@ import {
 	getAiSongGeneratorSongResults,
 	submitAiSongGeneratorTask,
 } from './aisonggenerator';
-import {
-	DiffRhythmGenerateParams,
-	TransformedSong as DiffRhythmSong,
-	generateDiffRhythmSong,
-	getDiffRhythmSongResults,
-} from './diffrhythm';
 import { ProviderError } from './errors';
 import { getProviderStateStub } from '../do';
 
@@ -41,8 +35,6 @@ interface ParsedSongRequest {
 	rawPrompt: string;
 }
 
-type LegacySource = 'aisonggenerator' | 'diffrhythm';
-
 const ATTEMPT_ID_RE = /^[A-Za-z0-9._:-]{16,128}$/;
 
 function invalidRequest(message: string): ProviderError {
@@ -58,16 +50,8 @@ function invalidRequest(message: string): ProviderError {
 function assertAisgOnlySource(source: string | undefined): void {
 	const resolved = source || 'aisonggenerator';
 	if (resolved !== 'aisonggenerator') {
-		throw invalidRequest("Invalid 'source'. Only 'aisonggenerator' is supported on task routes.");
+		throw invalidRequest("Invalid 'source'. Only 'aisonggenerator' is supported.");
 	}
-}
-
-function parseLegacySource(source: string | undefined): LegacySource {
-	const resolved = source || 'aisonggenerator';
-	if (resolved === 'aisonggenerator' || resolved === 'diffrhythm') {
-		return resolved;
-	}
-	throw invalidRequest("Invalid 'source'. Must be 'aisonggenerator' or 'diffrhythm'.");
 }
 
 function parseOptionalPositivePage(raw: string | undefined): number | undefined {
@@ -284,7 +268,7 @@ export async function getTask(ctx: Context<{ Bindings: Env }>) {
 
 export async function getSongs(ctx: Context<{ Bindings: Env }>) {
 	const { req, env } = ctx;
-	const source = parseLegacySource(req.query('source'));
+	assertAisgOnlySource(req.query('source'));
 
 	const idsQuery = req.query('ids');
 	if (!idsQuery) {
@@ -296,36 +280,17 @@ export async function getSongs(ctx: Context<{ Bindings: Env }>) {
 		throw invalidRequest("'ids' query parameter must not contain empty elements");
 	}
 
-	const results: Array<AiSongGeneratorSong | DiffRhythmSong> =
-		source === 'aisonggenerator'
-			? await getAiSongGeneratorSongResults(ids, env)
-			: await getDiffRhythmSongResults(ids, env);
+	const results: AiSongGeneratorSong[] = await getAiSongGeneratorSongResults(ids, env);
 	return ctx.json(results);
 }
 
 export async function postSongs(ctx: Context<{ Bindings: Env }>) {
-	const source = parseLegacySource(ctx.req.query('source'));
+	assertAisgOnlySource(ctx.req.query('source'));
 	const { params, attemptId, rawPrompt } = await parseSongRequest(ctx);
 
-	if (source === 'diffrhythm') {
-		if (attemptId) {
-			throw invalidRequest("Idempotency keys ('Idempotency-Key' / 'attempt_id') are not supported for 'diffrhythm'.");
-		}
-		const diffParams: DiffRhythmGenerateParams = {
-			title: params.title,
-			tags: params.styles.join(', '),
-			instrumental: params.instrumental,
-			lyrics: params.lyrics,
-			description: params.description,
-			isPublic: params.isPublic,
-		};
-		const uids = await generateDiffRhythmSong(diffParams, ctx.env);
-		return ctx.json(uids);
-	}
-
-	// Unkeyed legacy caller (live deployed smol-workflow without Idempotency-Key / attempt_id):
+	// Unkeyed legacy caller (without Idempotency-Key / attempt_id):
 	// never share DO state across independent requests, and preserve 6af87b5 non-retrying behavior
-	// when a single song is visible at loop exhaustion so the live caller does not re-pay AISG.
+	// when a single song is visible at loop exhaustion so unkeyed callers do not re-pay AISG.
 	if (!attemptId) {
 		const receipt = await submitAiSongGeneratorTask(params, ctx.env);
 		const musicIds = await findMusicIds(ctx.env, receipt.task_id, receipt.workspace_id, {

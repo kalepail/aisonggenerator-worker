@@ -7,7 +7,6 @@ import {
 	aisgAuthHeaders,
 	getAisgCredits,
 } from './api/aisonggenerator';
-import { normalizeDiffrhythmCookie, refreshDiffrhythmCookie } from './api/diffrhythm';
 import { ProviderError } from './api/errors';
 
 export interface AisgCreditsSnapshot extends AisgCredits {
@@ -49,7 +48,7 @@ export type AttemptClaimResult =
 const PROVIDER_STATE_DO_NAME = 'v0.0.0';
 const AISG_CREDITS_STORAGE_KEY = 'aisg_credits';
 const AISG_HEALTH_STORAGE_KEY = 'aisg_health';
-const DIFFRHYTHM_SESSION_STORAGE_KEY = 'session_token';
+const LEGACY_DIFFRHYTHM_SESSION_STORAGE_KEY = 'session_token';
 const ATTEMPT_STORAGE_PREFIX = 'attempt:';
 
 const ALLOWED_HEALTH_ERRORS = new Set([
@@ -128,53 +127,8 @@ function healthFromCreditsSnapshot(snapshot: AisgCreditsSnapshot): AisgHealthSna
 }
 
 export class DO extends DurableObject<Env> {
-	private diffrhythmRefresh?: Promise<string>;
-
 	constructor(state: DurableObjectState, env: Env) {
 		super(state, env);
-	}
-
-	// Legacy DiffRhythm session bridge retained while live smol-workflow still routes source=diffrhythm.
-	// Do not delete 'session_token' until Step-6 contraction after drain and rollback window close.
-	async getDiffrhythmSession(refresh = false): Promise<string> {
-		if (refresh) {
-			this.diffrhythmRefresh ??= this.refreshDiffrhythmSession().finally(() => {
-				this.diffrhythmRefresh = undefined;
-			});
-			return this.diffrhythmRefresh;
-		}
-
-		const stored = await this.ctx.storage.get<string>(DIFFRHYTHM_SESSION_STORAGE_KEY);
-		return stored || normalizeDiffrhythmCookie(this.env.DIFFRHYTHM_SESSION_COOKIE);
-	}
-
-	async refreshDiffrhythmSessionIfConfigured(): Promise<boolean> {
-		const stored = await this.ctx.storage.get<string>(DIFFRHYTHM_SESSION_STORAGE_KEY);
-		const fromEnv = normalizeDiffrhythmCookie(this.env.DIFFRHYTHM_SESSION_COOKIE);
-		if (!stored && !fromEnv) {
-			return false;
-		}
-		await this.getDiffrhythmSession(true);
-		return true;
-	}
-
-	private async refreshDiffrhythmSession(): Promise<string> {
-		const stored = await this.ctx.storage.get<string>(DIFFRHYTHM_SESSION_STORAGE_KEY);
-		const fromEnv = normalizeDiffrhythmCookie(this.env.DIFFRHYTHM_SESSION_COOKIE);
-		const candidates = [stored, fromEnv].filter((value): value is string => Boolean(value));
-		if (candidates.length === 0) {
-			throw new ProviderError('DiffRhythm session cookie is missing', {
-				status: 401,
-				provider: 'worker',
-				code: 'aisg_auth_error',
-				retryable: false,
-				outcome: 'rejected',
-			});
-		}
-
-		const sessionToken = await refreshDiffrhythmCookie(candidates);
-		await this.ctx.storage.put(DIFFRHYTHM_SESSION_STORAGE_KEY, sessionToken);
-		return sessionToken;
 	}
 
 	/**
@@ -441,6 +395,8 @@ export class DO extends DurableObject<Env> {
 
 		await this.ctx.storage.put(AISG_CREDITS_STORAGE_KEY, snapshot);
 		await this.ctx.storage.put(AISG_HEALTH_STORAGE_KEY, health);
+		// Step-6 contraction: safely retire only the obsolete DiffRhythm cookie key while preserving DO state.
+		await this.ctx.storage.delete(LEGACY_DIFFRHYTHM_SESSION_STORAGE_KEY);
 
 		if (credits.left_credits < MIN_TASK_CREDITS) {
 			console.error(
