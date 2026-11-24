@@ -152,11 +152,6 @@ interface UserProfileResponse {
 	};
 }
 
-interface StyleOptimizeResponse {
-	result?: unknown;
-	error?: unknown;
-}
-
 interface AudioRecoveryResponse {
 	success?: unknown;
 }
@@ -618,6 +613,7 @@ async function listMusic(env: Env, page: number, workspaceId?: string): Promise<
 	}
 
 	if (!response.ok) {
+		await response.body?.cancel().catch(() => {});
 		throw classifyReadStatusFailure('AISG song list request', response.status);
 	}
 
@@ -948,6 +944,7 @@ export async function getAisgCredits(env: Env): Promise<AisgCredits> {
 	}
 
 	if (!response.ok) {
+		await response.body?.cancel().catch(() => {});
 		throw classifyReadStatusFailure('AISG credits check', response.status);
 	}
 
@@ -982,62 +979,6 @@ export async function getAisgCredits(env: Env): Promise<AisgCredits> {
 		plan_tier: typeof data.plan_tier === 'string' && data.plan_tier.trim() ? data.plan_tier.trim() : null,
 		has_active_sub: Boolean(data.has_active_sub),
 	};
-}
-
-/**
- * Enhances a style prompt using AISG's free (0-credit) style optimizer.
- */
-export async function optimizeAisgStyle(content: string, env: Env): Promise<string> {
-	const input = clampString(content, STYLE_LIMIT);
-	if (!input) {
-		throw new ProviderError('Style content is empty', {
-			status: 400,
-			provider: 'aisonggenerator',
-			code: 'invalid_request',
-			retryable: false,
-			outcome: 'rejected',
-		});
-	}
-
-	const headers = aisgAuthHeaders(env, true);
-	let response: Response;
-	try {
-		response = await fetch(`${ORIGIN}/api/music/style/optimize`, {
-			method: 'POST',
-			headers,
-			body: JSON.stringify({ content: input }),
-			signal: AbortSignal.timeout(10000),
-		});
-	} catch (error) {
-		throw new ProviderError('AISG style optimize failed (network or timeout)', {
-			status: isTimeoutError(error) ? 504 : 502,
-			provider: 'aisonggenerator',
-			code: 'aisg_upstream_error',
-			retryable: true,
-			outcome: 'rejected',
-		});
-	}
-
-	if (!response.ok) {
-		throw classifyReadStatusFailure('AISG style optimize', response.status);
-	}
-
-	const parsed = await readJsonSafe<StyleOptimizeResponse>(response);
-	const optimized =
-		parsed.ok && typeof parsed.value?.result === 'string'
-			? clampString(parsed.value.result, STYLE_LIMIT)
-			: undefined;
-	if (!optimized) {
-		throw new ProviderError('AISG style optimize returned empty result', {
-			status: 502,
-			provider: 'aisonggenerator',
-			code: 'aisg_upstream_error',
-			retryable: true,
-			outcome: 'rejected',
-			upstreamStatus: response.status,
-		});
-	}
-	return optimized;
 }
 
 /**
@@ -1092,19 +1033,6 @@ export async function recoverAisgAudio(musicId: string, env: Env): Promise<boole
 }
 
 /**
- * Legacy combined submit + discovery helper kept for POST /api/songs compatibility.
- * New callers should use POST /api/tasks + GET /api/tasks/:id to separate paid submit from discovery.
- */
-export async function generateAiSongGeneratorSong(
-	params: AiSongGeneratorGenerateParams,
-	env: Env,
-	options?: FindMusicIdsOptions
-): Promise<string[]> {
-	const receipt = await submitAiSongGeneratorTask(params, env);
-	return findMusicIds(env, receipt.task_id, receipt.workspace_id, options);
-}
-
-/**
  * Retrieves song results for music ids.
  * Reserves the legacy pending row (status: 0) strictly for explicit missing results
  * (HTTP 404 or `{ success: true, data: null }`). Empty 200 bodies, `{ success: false }`
@@ -1139,10 +1067,11 @@ export async function getAiSongGeneratorSongResults(
 				});
 			}
 
-			if (response.status === 404) {
-				return null;
-			}
 			if (!response.ok) {
+				await response.body?.cancel().catch(() => {});
+				if (response.status === 404) {
+					return null;
+				}
 				throw classifyReadStatusFailure('AISG song status request', response.status);
 			}
 

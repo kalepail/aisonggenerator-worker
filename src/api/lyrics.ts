@@ -42,11 +42,12 @@ interface LyricsService {
 
 export const AISG_LYRICS_MAX_ATTEMPTS = 3;
 export const MIN_STYLE_TAGS = 2;
+const AISG_LYRICS_BUDGET_MS = 19_000;
 
 const LANGUAGE_RETRY_REMINDER =
 	'\n\nIMPORTANT: Write the title, lyrics, and style tags strictly in the exact language of the prompt above. Do not switch to another language.';
 
-async function fetchAisgLyricsOnce(prompt: string, env: Env): Promise<UnifiedLyricsResponse> {
+async function fetchAisgLyricsOnce(prompt: string, env: Env, timeoutMs: number): Promise<UnifiedLyricsResponse> {
 	let headers: HeadersInit;
 	try {
 		headers = aisgAuthHeaders(env, true);
@@ -64,13 +65,14 @@ async function fetchAisgLyricsOnce(prompt: string, env: Env): Promise<UnifiedLyr
 				model: 'openrouter/auto',
 				prompt,
 			}),
-			signal: AbortSignal.timeout(10000),
+			signal: AbortSignal.timeout(timeoutMs),
 		});
 	} catch (error) {
 		throw new LyricsServiceError(isTimeoutError(error) ? 'timeout' : 'network_error');
 	}
 
 	if (!res.ok) {
+		await res.body?.cancel().catch(() => {});
 		throw new LyricsServiceError(res.status === 401 || res.status === 403 ? 'auth_error' : 'http_error', res.status);
 	}
 
@@ -111,9 +113,15 @@ const lyricsServices: LyricsService[] = [
 	{
 		name: 'aisonggenerator.io',
 		fetch: async (prompt, env) => {
+			// Reserve up to 25 seconds for Workers AI within the workflow's 45-second request timeout.
+			const deadline = Date.now() + AISG_LYRICS_BUDGET_MS;
 			for (let attempt = 1; attempt <= AISG_LYRICS_MAX_ATTEMPTS; attempt++) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) {
+					throw new LyricsServiceError('timeout');
+				}
 				const attemptPrompt = attempt === 1 ? prompt : `${prompt}${LANGUAGE_RETRY_REMINDER}`;
-				const result = await fetchAisgLyricsOnce(attemptPrompt, env);
+				const result = await fetchAisgLyricsOnce(attemptPrompt, env, Math.min(10_000, remainingMs));
 				if (!hasUnexpectedChinese(prompt, result)) {
 					return result;
 				}

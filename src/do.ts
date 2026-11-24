@@ -48,7 +48,6 @@ export type AttemptClaimResult =
 const PROVIDER_STATE_DO_NAME = 'v0.0.0';
 const AISG_CREDITS_STORAGE_KEY = 'aisg_credits';
 const AISG_HEALTH_STORAGE_KEY = 'aisg_health';
-const LEGACY_DIFFRHYTHM_SESSION_STORAGE_KEY = 'session_token';
 const ATTEMPT_STORAGE_PREFIX = 'attempt:';
 
 const ALLOWED_HEALTH_ERRORS = new Set([
@@ -306,6 +305,7 @@ export class DO extends DurableObject<Env> {
 
 		if (!response.ok) {
 			const reason = `AISG session check failed (HTTP ${response.status})`;
+			await response.body?.cancel().catch(() => {});
 			await this.recordHealthFailure(checkedAt, false, null, prevCredits, reason);
 			throw new ProviderError(reason, {
 				status: response.status === 401 ? 401 : response.status === 403 ? 403 : 502,
@@ -395,8 +395,6 @@ export class DO extends DurableObject<Env> {
 
 		await this.ctx.storage.put(AISG_CREDITS_STORAGE_KEY, snapshot);
 		await this.ctx.storage.put(AISG_HEALTH_STORAGE_KEY, health);
-		// Step-6 contraction: safely retire only the obsolete DiffRhythm cookie key while preserving DO state.
-		await this.ctx.storage.delete(LEGACY_DIFFRHYTHM_SESSION_STORAGE_KEY);
 
 		if (credits.left_credits < MIN_TASK_CREDITS) {
 			console.error(

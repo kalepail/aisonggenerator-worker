@@ -4,6 +4,7 @@ import { hasUnexpectedChinese } from './language';
 export const PRIMARY_LYRICS_MODEL = '@cf/zai-org/glm-5.3';
 export const SECONDARY_LYRICS_MODEL = '@cf/deepseek-ai/deepseek-v4.1-flash-1017';
 export const FALLBACK_LYRICS_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const CF_LYRICS_BUDGET_MS = 25_000;
 
 export const SONGWRITER_SYSTEM_PROMPT = `You are a skilled, versatile songwriter and music producer writing songs for an AI music generator.
 
@@ -39,6 +40,7 @@ type CfLyricsFailureReason =
 	| 'insufficient_style_tags'
 	| 'unexpected_chinese'
 	| 'timeout'
+	| 'spend_limit'
 	| 'binding_error';
 
 class CfLyricsValidationError extends Error {
@@ -123,65 +125,94 @@ export function parseAndValidateSong(raw: unknown, prompt: string): SongWriteRes
 	return normalized;
 }
 
-async function runGlm53(env: Env, prompt: string): Promise<SongWriteResult> {
-	const result = await env.AI.run(PRIMARY_LYRICS_MODEL, {
-		messages: [
-			{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
-			{ role: 'user', content: prompt },
-		],
-		max_completion_tokens: 2600,
-		temperature: 0.75,
-		reasoning_effort: 'low',
-		response_format: { type: 'json_object' },
-	});
+type LyricsModel = typeof PRIMARY_LYRICS_MODEL | typeof SECONDARY_LYRICS_MODEL | typeof FALLBACK_LYRICS_MODEL;
+
+function runLyricsModel<Model extends LyricsModel>(
+	env: Env,
+	model: Model,
+	input: AiModels[Model]['inputs'],
+	signal: AbortSignal
+) {
+	const gatewayId = env.CF_AI_GATEWAY_ID?.trim();
+	return gatewayId
+		? env.AI.run(model, input, { gateway: { id: gatewayId }, signal })
+		: env.AI.run(model, input);
+}
+
+async function runGlm53(env: Env, prompt: string, signal: AbortSignal): Promise<SongWriteResult> {
+	const result = await runLyricsModel(
+		env,
+		PRIMARY_LYRICS_MODEL,
+		{
+			messages: [
+				{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
+				{ role: 'user', content: prompt },
+			],
+			max_completion_tokens: 2600,
+			temperature: 0.75,
+			reasoning_effort: 'low',
+			response_format: { type: 'json_object' },
+		},
+		signal
+	);
 
 	return parseAndValidateSong(extractModelDraft(result), prompt);
 }
 
-async function runDeepSeekFlash(env: Env, prompt: string): Promise<SongWriteResult> {
-	const result = await env.AI.run(SECONDARY_LYRICS_MODEL, {
-		messages: [
-			{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
-			{ role: 'user', content: prompt },
-		],
-		max_completion_tokens: 1600,
-		temperature: 0.75,
-		reasoning_effort: 'none',
-		response_format: { type: 'json_object' },
-	});
+async function runDeepSeekFlash(env: Env, prompt: string, signal: AbortSignal): Promise<SongWriteResult> {
+	const result = await runLyricsModel(
+		env,
+		SECONDARY_LYRICS_MODEL,
+		{
+			messages: [
+				{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
+				{ role: 'user', content: prompt },
+			],
+			max_completion_tokens: 1600,
+			temperature: 0.75,
+			reasoning_effort: 'none',
+			response_format: { type: 'json_object' },
+		},
+		signal
+	);
 
 	return parseAndValidateSong(extractModelDraft(result), prompt);
 }
 
-async function runLlama33Fallback(env: Env, prompt: string): Promise<SongWriteResult> {
-	const result = await env.AI.run(FALLBACK_LYRICS_MODEL, {
-		messages: [
-			{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
-			{ role: 'user', content: prompt },
-		],
-		max_tokens: 1400,
-		temperature: 0.75,
-		response_format: {
-			type: 'json_schema',
-			json_schema: {
-				type: 'object',
-				properties: {
-					title: { type: 'string' },
-					lyrics: { type: 'string' },
-					style: {
-						type: 'array',
-						items: { type: 'string' },
+async function runLlama33Fallback(env: Env, prompt: string, signal: AbortSignal): Promise<SongWriteResult> {
+	const result = await runLyricsModel(
+		env,
+		FALLBACK_LYRICS_MODEL,
+		{
+			messages: [
+				{ role: 'system', content: SONGWRITER_SYSTEM_PROMPT },
+				{ role: 'user', content: prompt },
+			],
+			max_tokens: 1400,
+			temperature: 0.75,
+			response_format: {
+				type: 'json_schema',
+				json_schema: {
+					type: 'object',
+					properties: {
+						title: { type: 'string' },
+						lyrics: { type: 'string' },
+						style: {
+							type: 'array',
+							items: { type: 'string' },
+						},
 					},
+					required: ['title', 'lyrics', 'style'],
 				},
-				required: ['title', 'lyrics', 'style'],
 			},
 		},
-	});
+		signal
+	);
 
 	return parseAndValidateSong(extractModelDraft(result), prompt);
 }
 
-const cfLyricsRunners: Array<{ model: string; run: (env: Env, prompt: string) => Promise<SongWriteResult> }> = [
+const cfLyricsRunners = [
 	{ model: PRIMARY_LYRICS_MODEL, run: runGlm53 },
 	{ model: SECONDARY_LYRICS_MODEL, run: runDeepSeekFlash },
 	{ model: FALLBACK_LYRICS_MODEL, run: runLlama33Fallback },
@@ -194,13 +225,43 @@ function classifyCfFailureReason(error: unknown): CfLyricsFailureReason {
 	if (isTimeoutError(error)) {
 		return 'timeout';
 	}
+	if (error instanceof Error) {
+		const detail = `${error.name}: ${error.message}`;
+		if (
+			/\bAiGatewayError:\s*(?:(?:2021|2052)\b|.*\bspend(?:ing)? limit\b.*\b(?:exceeded|reached)\b)/i.test(detail) ||
+			/\bAiError:\s*3036\b/.test(detail)
+		) {
+			return 'spend_limit';
+		}
+	}
 	return 'binding_error';
 }
 
 export async function songWrite(env: Env, prompt: string): Promise<SongWriteResult> {
-	for (const runner of cfLyricsRunners) {
+	const deadline = Date.now() + CF_LYRICS_BUDGET_MS;
+	for (const [index, runner] of cfLyricsRunners.entries()) {
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) {
+			break;
+		}
+
+		// Share the remaining time so an unresponsive model cannot starve later fallbacks.
+		const budgetMs = Math.floor(remainingMs / (cfLyricsRunners.length - index));
+		const controller = new AbortController();
+		const timeoutError = new DOMException('Cloudflare AI lyrics model timed out', 'TimeoutError');
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
-			return await runner.run(env, prompt);
+			const timeout = new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					reject(timeoutError);
+					controller.abort(timeoutError);
+				}, budgetMs);
+			});
+			const result = await Promise.race([runner.run(env, prompt, controller.signal), timeout]);
+			if (Date.now() >= deadline) {
+				throw timeoutError;
+			}
+			return result;
 		} catch (error) {
 			const reason = classifyCfFailureReason(error);
 			console.warn(
@@ -210,6 +271,11 @@ export async function songWrite(env: Env, prompt: string): Promise<SongWriteResu
 					reason,
 				})
 			);
+			if (reason === 'spend_limit') {
+				break;
+			}
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 	throw new Error('All Cloudflare AI lyrics models failed');

@@ -253,19 +253,13 @@ test("getAisgCredits sends bodyless POST /api/user and strips PII", async () => 
 	}
 });
 
-test("optimizeAisgStyle and recoverAisgAudio call free utility endpoints cleanly", async () => {
+test("recoverAisgAudio calls the free recovery endpoint cleanly", async () => {
 	const origFetch = globalThis.fetch;
 	const calls = [];
 
 	globalThis.fetch = async (url, init) => {
 		const urlStr = String(url);
 		calls.push({ url: urlStr, method: init.method, body: init.body });
-		if (urlStr.endsWith("/api/music/style/optimize")) {
-			return new Response(JSON.stringify({ result: "warm analog synthwave, 110 bpm, crisp snare" }), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		}
 		if (urlStr.endsWith("/api/music/song_123/audio/recovery")) {
 			return new Response(JSON.stringify({ success: true }), {
 				status: 200,
@@ -277,13 +271,13 @@ test("optimizeAisgStyle and recoverAisgAudio call free utility endpoints cleanly
 
 	try {
 		const env = { AISONGGENERATOR_SESSION_TOKEN: "tok" };
-		const optimized = await aisgMod.optimizeAisgStyle("synthwave", env);
-		assert.equal(optimized, "warm analog synthwave, 110 bpm, crisp snare");
-		assert.equal(JSON.parse(calls[0].body).content, "synthwave");
-
 		const recovered = await aisgMod.recoverAisgAudio("song_123", env);
 		assert.equal(recovered, true);
-		assert.equal(calls[1].method, "POST");
+		assert.deepEqual(calls, [{
+			url: "https://aisonggenerator.io/api/music/song_123/audio/recovery",
+			method: "POST",
+			body: undefined,
+		}]);
 	} finally {
 		globalThis.fetch = origFetch;
 	}

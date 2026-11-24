@@ -43,10 +43,6 @@ interface ChatCompletionOutput {
 }
 
 interface AiModels {
-	"@cf/zai-org/glm-5.3": {
-		inputs: ReasoningChatInput;
-		postProcessedOutputs: ChatCompletionOutput;
-	};
 	"@cf/deepseek-ai/deepseek-v4.1-flash-1017": {
 		inputs: ReasoningChatInput;
 		postProcessedOutputs: ChatCompletionOutput;

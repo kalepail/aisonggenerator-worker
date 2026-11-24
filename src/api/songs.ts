@@ -276,6 +276,9 @@ export async function getSongs(ctx: Context<{ Bindings: Env }>) {
 	}
 
 	const ids = idsQuery.split(',').map((id) => id.trim());
+	if (ids.length > 20) {
+		throw invalidRequest("'ids' query parameter must contain at most 20 IDs");
+	}
 	if (ids.length === 0 || ids.some((id) => id.length === 0)) {
 		throw invalidRequest("'ids' query parameter must not contain empty elements");
 	}

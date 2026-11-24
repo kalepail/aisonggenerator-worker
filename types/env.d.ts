@@ -2,4 +2,5 @@
 interface Env {
 	AISONGGENERATOR_SESSION_TOKEN: string;
 	AISONGGENERATOR_WORKSPACE_ID?: string;
+	CF_AI_GATEWAY_ID?: string;
 }

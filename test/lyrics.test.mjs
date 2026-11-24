@@ -265,3 +265,97 @@ test("songWrite falls back GLM-5.3 -> DeepSeek V4.1 Flash -> Llama 3.3 70B on er
 	assert.equal(result.title, "Late Train Home");
 	assert.equal(result.style.length, 4);
 });
+
+test("songWrite gives all three models a share of one 25-second deadline", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+	const calls = [];
+	const env = {
+		CF_AI_GATEWAY_ID: "test-gateway",
+		AI: {
+			run(model, _input, options) {
+				calls.push({ model, at: Date.now(), signal: options.signal });
+				return new Promise(() => {});
+			},
+		},
+	};
+
+	let settled = false;
+	const result = assert.rejects(cfMod.songWrite(env, "write a folk song"), /All Cloudflare AI lyrics models failed/)
+		.then(() => { settled = true; });
+	for (const duration of [8_333, 8_333, 8_333]) {
+		t.mock.timers.tick(duration);
+		await new Promise(setImmediate);
+	}
+	assert.deepEqual(calls.map(({ model, at }) => [model, at]), [
+		[cfMod.PRIMARY_LYRICS_MODEL, 0],
+		[cfMod.SECONDARY_LYRICS_MODEL, 8_333],
+		[cfMod.FALLBACK_LYRICS_MODEL, 16_666],
+	]);
+	assert.equal(settled, false);
+	t.mock.timers.tick(1);
+	await result;
+	assert.equal(Date.now(), 25_000);
+	assert.ok(calls.every(({ signal }) => signal.aborted));
+});
+
+test("songWrite forwards the optional gateway on every fallback and omits options when unset", async () => {
+	for (const gatewayId of [undefined, "test-gateway"]) {
+		const calls = [];
+		const env = {
+			CF_AI_GATEWAY_ID: gatewayId,
+			AI: {
+				async run(...args) {
+					calls.push(args);
+					if (args[0] !== cfMod.FALLBACK_LYRICS_MODEL) {
+						throw new Error("temporary model failure");
+					}
+					return { response: { title: "Song", lyrics: "Verse", style: ["folk", "acoustic"] } };
+				},
+			},
+		};
+
+		await cfMod.songWrite(env, "write a folk song");
+		assert.equal(calls.length, 3);
+		for (const args of calls) {
+			if (gatewayId) {
+				assert.deepEqual(args[2].gateway, { id: gatewayId });
+				assert.equal(args[2].signal.aborted, false);
+			} else {
+				assert.equal(args.length, 2);
+			}
+		}
+	}
+});
+
+test("songWrite stops fallback when AI Gateway reports an exhausted spend limit", async (t) => {
+	const ai = {
+		async run() {
+			throw new Error("AiGatewayError: 2052: Insufficient unified billing balance for this request");
+		},
+	};
+	const run = t.mock.method(ai, "run");
+	await assert.rejects(
+		cfMod.songWrite({ CF_AI_GATEWAY_ID: "test-gateway", AI: ai }, "write a folk song"),
+		/All Cloudflare AI lyrics models failed/
+	);
+	assert.equal(run.mock.callCount(), 1);
+});
+
+test("AISG lyrics retries reserve enough time for the Workers AI fallback", async (t) => {
+	t.mock.timers.enable({ apis: ["Date"] });
+	const timeout = t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
+	t.mock.method(globalThis, "fetch", async () => {
+		t.mock.timers.tick(9_500);
+		return Response.json({ title: "意外中文", lyrics: "意外的中文歌词", tags: "folk, acoustic" });
+	});
+	const env = {
+		AISONGGENERATOR_SESSION_TOKEN: "test-token",
+		AI: {
+			run: async () => ({ response: { title: "Song", lyrics: "Verse", style: ["folk", "acoustic"] } }),
+		},
+	};
+
+	const lyrics = await lyricsMod.generateLyricsWithFallback("write a folk song", env);
+	assert.equal(lyrics.service, "cloudflare-ai");
+	assert.deepEqual(timeout.mock.calls.map(({ arguments: [ms] }) => ms), [10_000, 9_500]);
+});

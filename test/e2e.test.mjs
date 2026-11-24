@@ -717,6 +717,93 @@ test("E2E ProviderError classification requires positive rejection BEFORE matchi
 	}
 });
 
+test("GET /api/songs accepts 20 IDs and rejects 21 before any upstream calls", async (t) => {
+	const upstream = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 404 }));
+	const env = createEnv();
+	const ids = Array.from({ length: 21 }, (_, i) => `song_${i}`);
+	const getSongs = (songIds) =>
+		workerMod.default.fetch(new Request(`http://aisonggenerator-worker/api/songs?ids=${songIds.join(",")}`), env);
+
+	const tooMany = await getSongs(ids);
+	assert.equal(tooMany.status, 400);
+	assert.equal((await tooMany.json()).code, "invalid_request");
+	assert.equal(upstream.mock.callCount(), 0);
+
+	const allowed = await getSongs(ids.slice(0, 20));
+	assert.equal(allowed.status, 200);
+	assert.equal((await allowed.json()).length, 20);
+	assert.equal(upstream.mock.callCount(), 20);
+});
+
+test("upstream errors release unread response bodies and preserve status diagnostics", async (t) => {
+	const env = createEnv({
+		AI: {
+			run: async () => ({ response: { title: "Song", lyrics: "Verse", style: ["folk", "acoustic"] } }),
+		},
+	});
+	const cancelled = [];
+	let upstreamStatus;
+	let upstreamPath;
+	let validSession = false;
+	t.mock.method(globalThis, "fetch", async (url) => {
+		const pathname = new URL(url).pathname;
+		if (validSession && pathname === "/api/auth/get-session") {
+			return Response.json({ user: { id: "test-user" } });
+		}
+		assert.equal(pathname, upstreamPath);
+		return new Response(new ReadableStream({
+			cancel() {
+				cancelled.push(pathname);
+				throw new Error("Stream cancellation failure");
+			},
+		}), { status: upstreamStatus });
+	});
+
+	const request = (path, init) => workerMod.default.fetch(new Request(`http://aisonggenerator-worker${path}`, init), env);
+
+	upstreamPath = "/api/music/list";
+	upstreamStatus = 429;
+	const task = await request("/api/tasks/task-1");
+	assert.equal(task.status, 429);
+	assert.equal((await task.json()).upstream_status, 429);
+
+	upstreamPath = "/api/music/missing";
+	upstreamStatus = 404;
+	const pending = await request("/api/songs?ids=missing");
+	assert.equal(pending.status, 200);
+	assert.equal((await pending.json())[0].status, 0);
+
+	upstreamPath = "/api/music/broken";
+	upstreamStatus = 503;
+	const song = await request("/api/songs?ids=broken");
+	assert.equal(song.status, 503);
+	assert.equal((await song.json()).upstream_status, 503);
+
+	upstreamPath = "/api/music/lyrics/generate";
+	upstreamStatus = 403;
+	const { result: lyrics, logs: lyricsLogs } = await captureConsole(() =>
+		request("/api/lyrics", { method: "POST", body: "write a folk song" })
+	);
+	assert.equal(lyrics.status, 200);
+	assert.equal((await lyrics.json()).service, "cloudflare-ai");
+	assert.match(lyricsLogs, /"reason":"auth_error","upstream_status":403/);
+
+	const stub = workerMod.getProviderStateStub(env);
+	upstreamPath = "/api/auth/get-session";
+	upstreamStatus = 401;
+	await assert.rejects(stub.checkAisgSession(), { status: 401, upstreamStatus: 401 });
+
+	upstreamPath = "/api/user";
+	upstreamStatus = 503;
+	validSession = true;
+	await assert.rejects(stub.checkAisgSession(), { status: 503, upstreamStatus: 503 });
+
+	assert.deepEqual(cancelled, [
+		"/api/music/list", "/api/music/missing", "/api/music/broken",
+		"/api/music/lyrics/generate", "/api/auth/get-session", "/api/user",
+	]);
+});
+
 test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, enforces 2+ tags, and strips raw provider diagnostics", async () => {
 	const origFetch = globalThis.fetch;
 
@@ -830,7 +917,7 @@ test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, 
 	}
 });
 
-test("E2E scheduled() cron retires legacy session_token safely, preserves aisg_credits, 0-credit GET /health, and closed-set error categories (no custom error.name leaks)", async () => {
+test("E2E scheduled() cron preserves existing state, 0-credit GET /health, and closed-set error categories (no custom error.name leaks)", async () => {
 	const origFetch = globalThis.fetch;
 	const env = createEnv();
 
@@ -864,6 +951,16 @@ test("E2E scheduled() cron retires legacy session_token safely, preserves aisg_c
 		assert.equal(fetchCalls, 0);
 
 		doStore.set("session_token", "__Secure-next-auth.session-token=stored-diff-tok");
+		const oldReceipt = {
+			attempt_id: "gen-old-completed-0001",
+			payload_hash: "test-hash",
+			status: "completed",
+			task_id: "task-1",
+			music_ids: ["one", "two"],
+			created_at: "2025-01-01T00:00:00.000Z",
+			updated_at: "2025-01-01T00:00:00.000Z",
+		};
+		doStore.set("attempt:gen-old-completed-0001", oldReceipt);
 		globalThis.fetch = async (url) => {
 			const urlStr = String(url);
 			if (urlStr === "https://aisonggenerator.io/api/auth/get-session") {
@@ -890,8 +987,8 @@ test("E2E scheduled() cron retires legacy session_token safely, preserves aisg_c
 		};
 
 		await workerMod.default.scheduled({}, env, {});
-		// Step-6 contraction: obsolete DiffRhythm key is safely retired while aisg_credits & aisg_health stay intact
-		assert.equal(doStore.has("session_token"), false);
+		assert.equal(doStore.get("session_token"), "__Secure-next-auth.session-token=stored-diff-tok");
+		assert.deepEqual(doStore.get("attempt:gen-old-completed-0001"), oldReceipt);
 		assert.ok(doStore.has("aisg_credits"));
 		assert.ok(doStore.has("aisg_health"));
 
