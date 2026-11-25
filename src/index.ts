@@ -179,55 +179,44 @@ app
 	})
 	.notFound((ctx) => ctx.body(null, 404));
 
-async function checkSession<T>(
-	name: string,
-	check: () => Promise<T>,
-	formatSuccess?: (result: T) => Record<string, unknown> | null
-) {
-	try {
-		const result = await check();
-		const fields = formatSuccess ? formatSuccess(result) : {};
-		if (fields !== null) {
-			console.log(JSON.stringify({ event: 'session_check_ok', name, ...fields }));
-		}
-	} catch (error) {
-		if (error instanceof ProviderError) {
-			console.error(
-				JSON.stringify({
-					event: 'session_check_failed',
-					name,
-					code: error.code,
-					status: error.status,
-					upstream_status: error.upstreamStatus,
-				})
-			);
-		} else {
-			console.error(
-				JSON.stringify({
-					event: 'session_check_failed',
-					name,
-					code: 'unexpected_error',
-					category: classifyUnexpectedErrorCategory(error),
-				})
-			);
-		}
-	}
-}
-
 export default {
 	fetch: app.fetch,
 	async scheduled(ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
 		const stub = getProviderStateStub(env);
 
-		await checkSession(
-			'AISG',
-			() => stub.checkAisgSession(),
-			(credits) => ({
-				left_credits: credits.left_credits,
-				plan_tier: credits.plan_tier,
-				has_active_sub: credits.has_active_sub,
-				session_expires_at: credits.session_expires_at,
-			})
-		);
+		try {
+			const credits = await stub.checkAisgSession();
+			console.log(
+				JSON.stringify({
+					event: 'session_check_ok',
+					name: 'AISG',
+					left_credits: credits.left_credits,
+					plan_tier: credits.plan_tier,
+					has_active_sub: credits.has_active_sub,
+					session_expires_at: credits.session_expires_at,
+				})
+			);
+		} catch (error) {
+			if (error instanceof ProviderError) {
+				console.error(
+					JSON.stringify({
+						event: 'session_check_failed',
+						name: 'AISG',
+						code: error.code,
+						status: error.status,
+						upstream_status: error.upstreamStatus,
+					})
+				);
+			} else {
+				console.error(
+					JSON.stringify({
+						event: 'session_check_failed',
+						name: 'AISG',
+						code: 'unexpected_error',
+						category: classifyUnexpectedErrorCategory(error),
+					})
+				);
+			}
+		}
 	},
 };

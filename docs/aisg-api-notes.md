@@ -71,7 +71,7 @@ Verified against `1m-2hjv3fd2k0.js` (`submitKind("main", ...)`) and `1i2y3_do1qq
 
 ## Session, Credit & Subscription Monitoring
 
-- **Cron cadence (`*/15 * * * *`):** Runs every 15 minutes (15× fewer outbound calls and DO wakeups than the legacy 1-minute schedule). Checks AISG (`get-session` + `POST /api/user`) and safely retires the obsolete DiffRhythm DO key `'session_token'` on success without touching `aisg_credits`, `aisg_health`, or `attempt:*`.
+- **Cron cadence (`*/15 * * * *`):** Runs every 15 minutes (15× fewer outbound calls and DO wakeups than the legacy 1-minute schedule). Checks AISG (`get-session` + `POST /api/user`) and persists credits and health under `aisg_credits` and `aisg_health` without touching `attempt:*`.
 - **Sliding Better Auth session (`GET /api/auth/get-session`):**
   - The Better Auth cookie (`__Secure-better-auth.session_token`) slides `session.expiresAt` forward by +7 days on server side whenever `GET /api/auth/get-session` runs after `updateAge` (24h).
   - `DO.checkAisgSession()` records `session_expires_at` alongside credits and logs structured warnings if `session_expires_at` drops below `48` hours remaining.

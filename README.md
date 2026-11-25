@@ -19,7 +19,7 @@ Send an `Idempotency-Key` header or an `attempt_id` field on paid submissions to
 - `AI` is the Workers AI binding used for lyric fallback.
 - `AISONGGENERATOR_SESSION_TOKEN` is the required AISongGenerator session secret.
 - `AISONGGENERATOR_WORKSPACE_ID` optionally sets the default workspace for submissions.
-- `CF_AI_GATEWAY_ID` optionally routes Workers AI requests through AI Gateway. Leave it unset (never point it at the ElevenLabs-only `smol` gateway, which is rate-limited to 25 req/day).
+- `CF_AI_GATEWAY_ID` optionally routes Workers AI requests through AI Gateway. Leave it unset (never point it at the ElevenLabs-only `smol` gateway, which is rate-limited to 60 req/day).
 
 ## Local development
 
