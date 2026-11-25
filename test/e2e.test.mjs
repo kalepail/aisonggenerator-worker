@@ -143,35 +143,40 @@ test("E2E split AISG submit (POST /api/tasks), multi-page discovery (GET /api/ta
 
 	try {
 		// 1) POST /api/tasks with Idempotency-Key submits once and retains receipt across replay
-		const taskBody = JSON.stringify({
+		const taskBody = {
 			title: "Midnight Tram",
 			style: ["indie pop", "jangly guitars"],
 			instrumental: false,
 			lyrics: "[Verse 1]\nSparks on the wire",
 			public: true,
 			workspace_id: "ws_page3",
-		});
-		const submitRes = await workerMod.default.fetch(
+			vocalGender: "f",
+			negativeTags: "male vocals, brass",
+		};
+		const submitTask = (body) => workerMod.default.fetch(
 			new Request("http://aisonggenerator-worker/api/tasks", {
 				method: "POST",
 				headers: { "Content-Type": "application/json", "Idempotency-Key": "task-attempt-key-0001" },
-				body: taskBody,
+				body: JSON.stringify(body),
 			}),
 			env
 		);
+		const submitRes = await submitTask(taskBody);
 		assert.equal(submitRes.status, 200);
 		assert.deepEqual(await submitRes.json(), { task_id: "task_split_1", workspace_id: "ws_page3" });
 		assert.equal(seenRequests.length, 1);
+		const upstreamBody = JSON.parse(seenRequests[0].body);
+		assert.equal(upstreamBody.vocalGender, taskBody.vocalGender);
+		assert.equal(upstreamBody.negativeTags, taskBody.negativeTags);
+
+		for (const change of [{ vocalGender: "m" }, { negativeTags: "brass" }]) {
+			const conflictRes = await submitTask({ ...taskBody, ...change });
+			assert.equal(conflictRes.status, 409);
+			assert.equal((await conflictRes.json()).code, "idempotency_conflict");
+		}
 
 		// Lost response replay returns identical task receipt with 0 extra submits
-		const replayRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/tasks", {
-				method: "POST",
-				headers: { "Content-Type": "application/json", "Idempotency-Key": "task-attempt-key-0001" },
-				body: taskBody,
-			}),
-			env
-		);
+		const replayRes = await submitTask(taskBody);
 		assert.equal(replayRes.status, 200);
 		assert.deepEqual(await replayRes.json(), { task_id: "task_split_1", workspace_id: "ws_page3" });
 		assert.equal(seenRequests.length, 1);
@@ -916,6 +921,55 @@ test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, 
 		globalThis.fetch = origFetch;
 	}
 });
+
+for (const service of ["aisonggenerator.io", "cloudflare-ai"]) {
+	test(`E2E POST /api/lyrics uses the raw prompt for the ${service} Han guard`, async (t) => {
+		const han = { title: "夜班诗人", lyrics: "凌晨的办公室", style: ["folk", "acoustic"] };
+		const english = { title: "Harbor Mist", lyrics: "Fog on the dock", style: ["folk", "acoustic"] };
+		const seenPrompts = [];
+		const draftFor = (prompt) => {
+			seenPrompts.push(prompt);
+			return seenPrompts.length === 1 ? han : english;
+		};
+		t.mock.method(globalThis, "fetch", async (_url, init) => {
+			if (service === "cloudflare-ai") {
+				return new Response(null, { status: 502 });
+			}
+			const draft = draftFor(JSON.parse(init.body).prompt);
+			return Response.json({ ...draft, tags: draft.style.join(", ") });
+		});
+		const env = createEnv({
+			AI: { run: async (_model, input) => ({ response: draftFor(input.messages[1].content) }) },
+		});
+		const wrap = (prompt, caption) => `# Prompt\r\n${prompt}\r\n\r\n        # Description\r\n${caption}`;
+		const englishPrompt = wrap("Dream pop about the harbor", "海港的霧");
+		const chinesePrompt = wrap("一首关于雨夜的歌", "Rain on the harbor");
+		const japanesePrompt = wrap("おやすみのうた", "Rain on the harbor");
+
+		for (const [body, allowsHan] of [
+			[{ prompt: englishPrompt }, false],
+			[{ prompt: chinesePrompt }, true],
+			[{ prompt: japanesePrompt }, true],
+			[{ prompt: chinesePrompt, user_prompt: "English folk song" }, false],
+			[{ prompt: englishPrompt, user_prompt: "J-pop ballad" }, true],
+			[{ prompt: chinesePrompt, user_prompt: "" }, false],
+			[{ prompt: chinesePrompt, user_prompt: 123 }, true],
+		]) {
+			seenPrompts.length = 0;
+			const res = await workerMod.default.fetch(new Request("http://aisonggenerator-worker/api/lyrics", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			}), env);
+			assert.equal(res.status, 200);
+			const result = await res.json();
+			assert.equal(result.service, service);
+			assert.equal(result.title, (allowsHan ? han : english).title, JSON.stringify(body));
+			assert.equal(seenPrompts.length, allowsHan ? 1 : 2);
+			assert.equal(seenPrompts[0], body.prompt);
+		}
+	});
+}
 
 test("E2E scheduled() cron preserves existing state, 0-credit GET /health, and closed-set error categories (no custom error.name leaks)", async () => {
 	const origFetch = globalThis.fetch;

@@ -66,7 +66,7 @@ test("hasUnexpectedChinese catches Han in title, lyrics, or style tags unless ex
 	);
 
 	// Korean Hangul is allowed on K-pop prompt, Han is not
-	const koPrompt = "K-pop track, half Korean and half English";
+	const koPrompt = "서울의 밤 K-pop track, half Korean and half English";
 	assert.equal(
 		languageMod.hasUnexpectedChinese(koPrompt, {
 			title: "Bob (밥)",
@@ -95,7 +95,7 @@ test("hasUnexpectedChinese catches Han in title, lyrics, or style tags unless ex
 	);
 });
 
-test("aisonggenerator.io retries on unexpected Chinese and succeeds when a retry returns English", async () => {
+test("aisonggenerator.io retries unexpected Chinese for an English glossy anime prompt", async () => {
 	const origFetch = globalThis.fetch;
 	const seenPrompts = [];
 	let calls = 0;
@@ -134,7 +134,7 @@ test("aisonggenerator.io retries on unexpected Chinese and succeeds when a retry
 				},
 			},
 		};
-		const result = await lyricsMod.generateLyricsWithFallback("hip hop style, everyday working person song", env);
+		const result = await lyricsMod.generateLyricsWithFallback("glossy anime opening about clocking in for work", env);
 		assert.equal(calls, 3);
 		assert.equal(result.service, "aisonggenerator.io");
 		assert.equal(result.title, "Time Clock Hero");

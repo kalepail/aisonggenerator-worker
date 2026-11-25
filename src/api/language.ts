@@ -1,7 +1,7 @@
 const HAN_SCRIPT_RE = /\p{Script=Han}/u;
 const KANA_SCRIPT_RE = /[\p{Script=Hiragana}\p{Script=Katakana}]/u;
 const EXPLICIT_HAN_LANGUAGE_RE =
-	/\b(chinese|mandarin|cantonese|taiwanese|hokkien|c-?pop|mandopop|cantopop|zhongwen|putonghua|guoyu|hanzi|japanese|j-?pop|j-?rock|anime|kanji|nihongo)\b/i;
+	/\b(chinese|mandarin|cantonese|taiwanese|hokkien|c-?pop|mandopop|cantopop|zhongwen|putonghua|guoyu|hanzi|japanese|j-?pop|j-?rock|kanji|nihongo)\b/i;
 
 export interface LyricsCandidate {
 	title?: string | null;

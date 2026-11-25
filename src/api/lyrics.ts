@@ -37,7 +37,7 @@ class LyricsServiceError extends Error {
 // Service definition for cleaner iteration
 interface LyricsService {
 	name: 'aisonggenerator.io' | 'cloudflare-ai';
-	fetch: (prompt: string, env: Env) => Promise<UnifiedLyricsResponse>;
+	fetch: (prompt: string, env: Env, guardPrompt: string) => Promise<UnifiedLyricsResponse>;
 }
 
 export const AISG_LYRICS_MAX_ATTEMPTS = 3;
@@ -112,7 +112,7 @@ async function fetchAisgLyricsOnce(prompt: string, env: Env, timeoutMs: number):
 const lyricsServices: LyricsService[] = [
 	{
 		name: 'aisonggenerator.io',
-		fetch: async (prompt, env) => {
+		fetch: async (prompt, env, guardPrompt) => {
 			// Reserve up to 25 seconds for Workers AI within the workflow's 45-second request timeout.
 			const deadline = Date.now() + AISG_LYRICS_BUDGET_MS;
 			for (let attempt = 1; attempt <= AISG_LYRICS_MAX_ATTEMPTS; attempt++) {
@@ -122,7 +122,7 @@ const lyricsServices: LyricsService[] = [
 				}
 				const attemptPrompt = attempt === 1 ? prompt : `${prompt}${LANGUAGE_RETRY_REMINDER}`;
 				const result = await fetchAisgLyricsOnce(attemptPrompt, env, Math.min(10_000, remainingMs));
-				if (!hasUnexpectedChinese(prompt, result)) {
+				if (!hasUnexpectedChinese(guardPrompt, result)) {
 					return result;
 				}
 				console.warn(
@@ -138,9 +138,9 @@ const lyricsServices: LyricsService[] = [
 	},
 	{
 		name: 'cloudflare-ai',
-		fetch: async (prompt, env) => {
+		fetch: async (prompt, env, guardPrompt) => {
 			try {
-				return { ...(await songWrite(env, prompt)), service: 'cloudflare-ai' };
+				return { ...(await songWrite(env, prompt, guardPrompt)), service: 'cloudflare-ai' };
 			} catch {
 				throw new LyricsServiceError('all_models_failed');
 			}
@@ -168,17 +168,24 @@ function classifyLyricsFailure(error: unknown): { reason: LyricsFailureReason; u
 	return { reason: 'service_failed' };
 }
 
-export async function generateLyricsWithFallback(prompt: string, env: Env): Promise<UnifiedLyricsResponse> {
+function extractPromptSection(prompt: string): string | undefined {
+	// Legacy workflow prompts indent their top-level headings.
+	const [, section] = prompt.split(/^[\t ]*# Prompt[\t ]*(?:\r?\n|$)/m, 2);
+	return section?.split(/^[\t ]*# /m, 1)[0];
+}
+
+export async function generateLyricsWithFallback(prompt: string, env: Env, userPrompt?: string): Promise<UnifiedLyricsResponse> {
 	const trimmedPrompt = prompt.trim();
 	if (!trimmedPrompt) {
 		throw invalidLyricsRequest('Prompt is required');
 	}
+	const guardPrompt = userPrompt ?? extractPromptSection(trimmedPrompt) ?? trimmedPrompt;
 
 	const failures: Array<{ service: string; reason: LyricsFailureReason; upstream_status?: number }> = [];
 
 	for (const service of lyricsServices) {
 		try {
-			const result = await service.fetch(trimmedPrompt, env);
+			const result = await service.fetch(trimmedPrompt, env, guardPrompt);
 			return result;
 		} catch (error) {
 			const detail = classifyLyricsFailure(error);
@@ -206,44 +213,35 @@ export async function lyrics(ctx: Context<{ Bindings: Env }>) {
 	const contentType = (ctx.req.header('content-type') || '').toLowerCase();
 	const isDeclaredJson = contentType.includes('application/json') || contentType.includes('+json');
 	const requestBody = await ctx.req.text();
-	let prompt = '';
+	let prompt = requestBody;
+	let userPrompt: string | undefined;
 
-	if (isDeclaredJson) {
+	// Preserve raw text and accept JSON objects sent without a JSON Content-Type header.
+	if (isDeclaredJson || requestBody.trim()) {
 		let parsedBody: unknown;
 		try {
 			parsedBody = JSON.parse(requestBody);
 		} catch {
-			throw invalidLyricsRequest('Invalid JSON request body');
+			if (isDeclaredJson) {
+				throw invalidLyricsRequest('Invalid JSON request body');
+			}
 		}
 		if (
-			!parsedBody ||
-			typeof parsedBody !== 'object' ||
-			Array.isArray(parsedBody) ||
-			typeof (parsedBody as { prompt?: unknown }).prompt !== 'string'
+			parsedBody &&
+			typeof parsedBody === 'object' &&
+			!Array.isArray(parsedBody) &&
+			'prompt' in parsedBody &&
+			typeof parsedBody.prompt === 'string'
 		) {
-			throw invalidLyricsRequest("JSON request body must include a string 'prompt'");
-		}
-		prompt = (parsedBody as { prompt: string }).prompt;
-	} else if (requestBody.trim()) {
-		// Preserve raw-text lyrics callers (e.g. text/plain or omitted Content-Type),
-		// while still accepting valid JSON objects sent without a JSON Content-Type header.
-		try {
-			const parsedBody: unknown = JSON.parse(requestBody);
-			if (
-				parsedBody &&
-				typeof parsedBody === 'object' &&
-				!Array.isArray(parsedBody) &&
-				typeof (parsedBody as { prompt?: unknown }).prompt === 'string'
-			) {
-				prompt = (parsedBody as { prompt: string }).prompt;
-			} else {
-				prompt = requestBody;
+			prompt = parsedBody.prompt;
+			if ('user_prompt' in parsedBody && typeof parsedBody.user_prompt === 'string') {
+				userPrompt = parsedBody.user_prompt;
 			}
-		} catch {
-			prompt = requestBody;
+		} else if (isDeclaredJson) {
+			throw invalidLyricsRequest("JSON request body must include a string 'prompt'");
 		}
 	}
 
-	const result = await generateLyricsWithFallback(prompt, ctx.env);
+	const result = await generateLyricsWithFallback(prompt, ctx.env, userPrompt);
 	return ctx.json(result);
 }

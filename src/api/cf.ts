@@ -72,7 +72,7 @@ export function extractModelDraft(result: unknown): unknown {
 	return undefined;
 }
 
-export function parseAndValidateSong(raw: unknown, prompt: string): SongWriteResult {
+export function parseAndValidateSong(raw: unknown, guardPrompt: string): SongWriteResult {
 	let draft = raw;
 	if (typeof draft === 'string') {
 		const cleaned = draft.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
@@ -118,7 +118,7 @@ export function parseAndValidateSong(raw: unknown, prompt: string): SongWriteRes
 		);
 	}
 
-	if (hasUnexpectedChinese(prompt, normalized)) {
+	if (hasUnexpectedChinese(guardPrompt, normalized)) {
 		throw new CfLyricsValidationError('Cloudflare AI returned unexpected Chinese output', 'unexpected_chinese');
 	}
 
@@ -139,8 +139,8 @@ function runLyricsModel<Model extends LyricsModel>(
 		: env.AI.run(model, input);
 }
 
-async function runGlm53(env: Env, prompt: string, signal: AbortSignal): Promise<SongWriteResult> {
-	const result = await runLyricsModel(
+function runGlm53(env: Env, prompt: string, signal: AbortSignal) {
+	return runLyricsModel(
 		env,
 		PRIMARY_LYRICS_MODEL,
 		{
@@ -155,12 +155,10 @@ async function runGlm53(env: Env, prompt: string, signal: AbortSignal): Promise<
 		},
 		signal
 	);
-
-	return parseAndValidateSong(extractModelDraft(result), prompt);
 }
 
-async function runDeepSeekFlash(env: Env, prompt: string, signal: AbortSignal): Promise<SongWriteResult> {
-	const result = await runLyricsModel(
+function runDeepSeekFlash(env: Env, prompt: string, signal: AbortSignal) {
+	return runLyricsModel(
 		env,
 		SECONDARY_LYRICS_MODEL,
 		{
@@ -175,12 +173,10 @@ async function runDeepSeekFlash(env: Env, prompt: string, signal: AbortSignal): 
 		},
 		signal
 	);
-
-	return parseAndValidateSong(extractModelDraft(result), prompt);
 }
 
-async function runLlama33Fallback(env: Env, prompt: string, signal: AbortSignal): Promise<SongWriteResult> {
-	const result = await runLyricsModel(
+function runLlama33Fallback(env: Env, prompt: string, signal: AbortSignal) {
+	return runLyricsModel(
 		env,
 		FALLBACK_LYRICS_MODEL,
 		{
@@ -208,8 +204,6 @@ async function runLlama33Fallback(env: Env, prompt: string, signal: AbortSignal)
 		},
 		signal
 	);
-
-	return parseAndValidateSong(extractModelDraft(result), prompt);
 }
 
 const cfLyricsRunners = [
@@ -237,7 +231,7 @@ function classifyCfFailureReason(error: unknown): CfLyricsFailureReason {
 	return 'binding_error';
 }
 
-export async function songWrite(env: Env, prompt: string): Promise<SongWriteResult> {
+export async function songWrite(env: Env, prompt: string, guardPrompt = prompt): Promise<SongWriteResult> {
 	const deadline = Date.now() + CF_LYRICS_BUDGET_MS;
 	for (const [index, runner] of cfLyricsRunners.entries()) {
 		const remainingMs = deadline - Date.now();
@@ -257,7 +251,8 @@ export async function songWrite(env: Env, prompt: string): Promise<SongWriteResu
 					controller.abort(timeoutError);
 				}, budgetMs);
 			});
-			const result = await Promise.race([runner.run(env, prompt, controller.signal), timeout]);
+			const draft = await Promise.race([runner.run(env, prompt, controller.signal), timeout]);
+			const result = parseAndValidateSong(extractModelDraft(draft), guardPrompt);
 			if (Date.now() >= deadline) {
 				throw timeoutError;
 			}
