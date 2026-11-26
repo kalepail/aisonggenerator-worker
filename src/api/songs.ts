@@ -10,6 +10,7 @@ import {
 	submitAiSongGeneratorTask,
 } from './aisonggenerator';
 import { ProviderError } from './errors';
+import { extractSmolId } from './lyrics';
 import { getProviderStateStub } from '../do';
 
 interface SongRequestBody {
@@ -210,10 +211,22 @@ function unresolvedAttemptError(): ProviderError {
 
 export async function postTask(ctx: Context<{ Bindings: Env }>) {
 	assertAisgOnlySource(ctx.req.query('source'));
+	const startedAt = Date.now();
+	const smolId = extractSmolId(ctx.req.header('x-smol-id'));
 	const { params, attemptId, rawPrompt } = await parseSongRequest(ctx);
 
 	if (!attemptId) {
 		const receipt = await submitAiSongGeneratorTask(params, ctx.env);
+		console.log(
+			JSON.stringify({
+				event: 'aisg_task_submitted',
+				...(smolId ? { smol_id: smolId } : {}),
+				task_id: receipt.task_id,
+				replayed: false,
+				instrumental: params.instrumental,
+				ms: Date.now() - startedAt,
+			})
+		);
 		return ctx.json(receipt);
 	}
 
@@ -229,6 +242,16 @@ export async function postTask(ctx: Context<{ Bindings: Env }>) {
 	if (claim.action === 'existing') {
 		const existing = claim.receipt;
 		if ((existing.status === 'accepted' || existing.status === 'completed') && existing.task_id) {
+			console.log(
+				JSON.stringify({
+					event: 'aisg_task_submitted',
+					...(smolId ? { smol_id: smolId } : {}),
+					task_id: existing.task_id,
+					replayed: true,
+					instrumental: params.instrumental,
+					ms: Date.now() - startedAt,
+				})
+			);
 			return ctx.json(
 				existing.workspace_id
 					? { task_id: existing.task_id, workspace_id: existing.workspace_id }
@@ -251,6 +274,16 @@ export async function postTask(ctx: Context<{ Bindings: Env }>) {
 	}
 
 	await stub.recordAttemptAccepted(attemptId, payloadHash, receipt.task_id, receipt.workspace_id);
+	console.log(
+		JSON.stringify({
+			event: 'aisg_task_submitted',
+			...(smolId ? { smol_id: smolId } : {}),
+			task_id: receipt.task_id,
+			replayed: false,
+			instrumental: params.instrumental,
+			ms: Date.now() - startedAt,
+		})
+	);
 	return ctx.json(receipt);
 }
 

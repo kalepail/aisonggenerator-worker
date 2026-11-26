@@ -34,7 +34,7 @@ export interface SongWriteResult {
 	style: string[];
 }
 
-type CfLyricsFailureReason =
+export type CfLyricsFailureReason =
 	| 'invalid_json'
 	| 'invalid_schema'
 	| 'insufficient_style_tags'
@@ -42,6 +42,31 @@ type CfLyricsFailureReason =
 	| 'timeout'
 	| 'spend_limit'
 	| 'binding_error';
+
+export type LyricsModel = typeof PRIMARY_LYRICS_MODEL | typeof SECONDARY_LYRICS_MODEL | typeof FALLBACK_LYRICS_MODEL;
+
+export interface CfLyricsModelFailure {
+	model: LyricsModel;
+	reason: CfLyricsFailureReason;
+}
+
+export interface SongWriteDetailedResult extends SongWriteResult {
+	model: LyricsModel;
+	attempts: number;
+	failures: CfLyricsModelFailure[];
+}
+
+export class CfLyricsAllModelsFailedError extends Error {
+	readonly attempts: number;
+	readonly failures: CfLyricsModelFailure[];
+
+	constructor(attempts: number, failures: CfLyricsModelFailure[]) {
+		super('All Cloudflare AI lyrics models failed');
+		this.name = 'CfLyricsAllModelsFailedError';
+		this.attempts = attempts;
+		this.failures = failures;
+	}
+}
 
 class CfLyricsValidationError extends Error {
 	readonly reason: CfLyricsFailureReason;
@@ -125,8 +150,6 @@ export function parseAndValidateSong(raw: unknown, guardPrompt: string): SongWri
 	return normalized;
 }
 
-type LyricsModel = typeof PRIMARY_LYRICS_MODEL | typeof SECONDARY_LYRICS_MODEL | typeof FALLBACK_LYRICS_MODEL;
-
 function runLyricsModel<Model extends LyricsModel>(
 	env: Env,
 	model: Model,
@@ -206,7 +229,10 @@ function runLlama33Fallback(env: Env, prompt: string, signal: AbortSignal) {
 	);
 }
 
-const cfLyricsRunners = [
+const cfLyricsRunners: Array<{
+	model: LyricsModel;
+	run: (env: Env, prompt: string, signal: AbortSignal) => Promise<unknown>;
+}> = [
 	{ model: PRIMARY_LYRICS_MODEL, run: runGlm53 },
 	{ model: SECONDARY_LYRICS_MODEL, run: runDeepSeekFlash },
 	{ model: FALLBACK_LYRICS_MODEL, run: runLlama33Fallback },
@@ -231,14 +257,22 @@ function classifyCfFailureReason(error: unknown): CfLyricsFailureReason {
 	return 'binding_error';
 }
 
-export async function songWrite(env: Env, prompt: string, guardPrompt = prompt): Promise<SongWriteResult> {
+export async function songWrite(
+	env: Env,
+	prompt: string,
+	guardPrompt = prompt,
+	smolId?: string
+): Promise<SongWriteDetailedResult> {
 	const deadline = Date.now() + CF_LYRICS_BUDGET_MS;
+	let attempts = 0;
+	const failures: CfLyricsModelFailure[] = [];
 	for (const [index, runner] of cfLyricsRunners.entries()) {
 		const remainingMs = deadline - Date.now();
 		if (remainingMs <= 0) {
 			break;
 		}
 
+		attempts++;
 		// Share the remaining time so an unresponsive model cannot starve later fallbacks.
 		const budgetMs = Math.floor(remainingMs / (cfLyricsRunners.length - index));
 		const controller = new AbortController();
@@ -256,12 +290,19 @@ export async function songWrite(env: Env, prompt: string, guardPrompt = prompt):
 			if (Date.now() >= deadline) {
 				throw timeoutError;
 			}
-			return result;
+			return {
+				...result,
+				model: runner.model,
+				attempts,
+				failures,
+			};
 		} catch (error) {
 			const reason = classifyCfFailureReason(error);
+			failures.push({ model: runner.model, reason });
 			console.warn(
 				JSON.stringify({
 					event: 'cf_ai_lyrics_failed',
+					...(smolId ? { smol_id: smolId } : {}),
 					model: runner.model,
 					reason,
 				})
@@ -273,5 +314,5 @@ export async function songWrite(env: Env, prompt: string, guardPrompt = prompt):
 			clearTimeout(timer);
 		}
 	}
-	throw new Error('All Cloudflare AI lyrics models failed');
+	throw new CfLyricsAllModelsFailedError(attempts, failures);
 }

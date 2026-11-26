@@ -8,7 +8,7 @@ import {
 	SESSION_EXPIRY_WARN_HOURS,
 } from './api/aisonggenerator';
 import { ProviderError, classifyUnexpectedErrorCategory } from './api/errors';
-import { lyrics } from './api/lyrics';
+import { extractSmolId, lyrics } from './api/lyrics';
 import { getSongs, getTask, postSongs, postTask } from './api/songs';
 import {
 	getProviderStateStub,
@@ -123,10 +123,12 @@ app
 	.post('/api/songs', postSongs)
 	.get('/api/songs', getSongs)
 	.onError((err, ctx) => {
+		const smolId = extractSmolId(ctx.req.header('x-smol-id'));
 		if (err instanceof ProviderError) {
 			console.error(
 				JSON.stringify({
 					event: 'provider_error',
+					...(smolId ? { smol_id: smolId } : {}),
 					provider: err.provider,
 					code: err.code,
 					status: err.status,
@@ -144,6 +146,7 @@ app
 			console.error(
 				JSON.stringify({
 					event: 'http_exception',
+					...(smolId ? { smol_id: smolId } : {}),
 					status,
 				})
 			);
@@ -162,6 +165,7 @@ app
 		console.error(
 			JSON.stringify({
 				event: 'unexpected_error',
+				...(smolId ? { smol_id: smolId } : {}),
 				category: classifyUnexpectedErrorCategory(err),
 			})
 		);

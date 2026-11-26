@@ -137,6 +137,11 @@ test("aisonggenerator.io retries unexpected Chinese for an English glossy anime 
 		const result = await lyricsMod.generateLyricsWithFallback("glossy anime opening about clocking in for work", env);
 		assert.equal(calls, 3);
 		assert.equal(result.service, "aisonggenerator.io");
+		assert.equal(result.model, lyricsMod.AISG_LYRICS_MODEL);
+		assert.equal(result.meta.service, "aisonggenerator.io");
+		assert.equal(result.meta.aisg_attempts, 3);
+		assert.equal(result.meta.cf_attempts, 0);
+		assert.equal(result.meta.fallbacks.length, 2);
 		assert.equal(result.title, "Time Clock Hero");
 		assert.doesNotMatch(seenPrompts[0], /IMPORTANT:/);
 		assert.match(seenPrompts[1], /IMPORTANT:/);
@@ -193,6 +198,10 @@ test("aisonggenerator.io falls back directly to Cloudflare AI after 3 unexpected
 		const result = await lyricsMod.generateLyricsWithFallback("hip hop style, everyday working person song", env);
 		assert.equal(aisgCalls, 3);
 		assert.equal(result.service, "cloudflare-ai");
+		assert.equal(result.model, cfMod.PRIMARY_LYRICS_MODEL);
+		assert.equal(result.meta.aisg_attempts, 3);
+		assert.equal(result.meta.cf_attempts, 1);
+		assert.equal(result.meta.fallbacks.length, 3);
 		assert.equal(result.title, "Clock In, Clock Out");
 		assert.equal(aiModelsCalled.length, 1);
 		assert.equal(aiModelsCalled[0].model, cfMod.PRIMARY_LYRICS_MODEL);
@@ -357,5 +366,65 @@ test("AISG lyrics retries reserve enough time for the Workers AI fallback", asyn
 
 	const lyrics = await lyricsMod.generateLyricsWithFallback("write a folk song", env);
 	assert.equal(lyrics.service, "cloudflare-ai");
+	assert.equal(lyrics.model, cfMod.PRIMARY_LYRICS_MODEL);
+	assert.equal(lyrics.meta.aisg_attempts, 2);
+	assert.equal(lyrics.meta.cf_attempts, 1);
 	assert.deepEqual(timeout.mock.calls.map(({ arguments: [ms] }) => ms), [10_000, 9_500]);
+});
+
+test("lyrics logs correlate X-Smol-Id and expose winning model and fallback chain", async (t) => {
+	const logs = [];
+	t.mock.method(console, "log", (line) => logs.push(String(line)));
+	t.mock.method(console, "warn", (line) => logs.push(String(line)));
+	t.mock.method(globalThis, "fetch", async () => new Response("upstream down", { status: 502 }));
+
+	const env = {
+		AISONGGENERATOR_SESSION_TOKEN: "test-token",
+		AI: {
+			run: async (model) => {
+				if (model === cfMod.PRIMARY_LYRICS_MODEL) {
+					throw new Error("glm hiccup");
+				}
+				return {
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({
+									title: "Harbor Glow",
+									lyrics: "[Verse 1]\nWarm lamps on the dock",
+									style: ["indie folk", "acoustic guitar"],
+								}),
+							},
+						},
+					],
+				};
+			},
+		},
+	};
+
+	const result = await lyricsMod.generateLyricsWithFallback(
+		"harbor night",
+		env,
+		"harbor night",
+		"229ef31696aadf4881dd27529d9e3b02984a75ccec257fbb4c107f6ea9157931"
+	);
+	assert.equal(result.service, "cloudflare-ai");
+	assert.equal(result.model, cfMod.SECONDARY_LYRICS_MODEL);
+	assert.equal(result.meta.aisg_attempts, 1);
+	assert.equal(result.meta.cf_attempts, 2);
+	assert.deepEqual(result.meta.fallbacks, [
+		{ service: "aisonggenerator.io", model: "openrouter/auto", reason: "http_error", upstream_status: 502 },
+		{ service: "cloudflare-ai", model: cfMod.PRIMARY_LYRICS_MODEL, reason: "binding_error" },
+	]);
+	const parsed = logs.map((line) => JSON.parse(line));
+	const okLog = parsed.find((e) => e.event === "lyrics_generated");
+	assert.ok(okLog);
+	assert.equal(okLog.smol_id, "229ef31696aadf4881dd27529d9e3b02984a75ccec257fbb4c107f6ea9157931");
+	assert.equal(okLog.service, "cloudflare-ai");
+	assert.equal(okLog.model, cfMod.SECONDARY_LYRICS_MODEL);
+	assert.equal(okLog.aisg_attempts, 1);
+	assert.equal(okLog.cf_attempts, 2);
+	assert.equal(okLog.fallback_count, 2);
+	assert.equal(lyricsMod.extractSmolId("bad id with spaces"), undefined);
+	assert.equal(lyricsMod.extractSmolId("229ef31696aadf4881dd27529d9e3b02984a75ccec257fbb4c107f6ea9157931"), "229ef31696aadf4881dd27529d9e3b02984a75ccec257fbb4c107f6ea9157931");
 });
