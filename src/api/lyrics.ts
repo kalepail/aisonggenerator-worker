@@ -63,12 +63,9 @@ class LyricsServiceError extends Error {
 	}
 }
 
-export const AISG_LYRICS_MAX_ATTEMPTS = 3;
+export const AISG_LYRICS_MAX_ATTEMPTS = 1;
 export const MIN_STYLE_TAGS = 2;
-const AISG_LYRICS_BUDGET_MS = 19_000;
-
-const LANGUAGE_RETRY_REMINDER =
-	'\n\nIMPORTANT: Write the title, lyrics, and style tags strictly in the exact language of the prompt above. Do not switch to another language.';
+const AISG_EMERGENCY_TIMEOUT_MS = 8_000;
 
 async function fetchAisgLyricsOnce(prompt: string, env: Env, timeoutMs: number): Promise<UnifiedLyricsResponse> {
 	let headers: HeadersInit;
@@ -177,81 +174,7 @@ export async function generateLyricsWithFallback(
 	let aisgAttempts = 0;
 	let cfAttempts = 0;
 
-	// 1) Primary: aisonggenerator.io
-	try {
-		// Reserve up to 25 seconds for Workers AI within the workflow's 45-second request timeout.
-		const deadline = Date.now() + AISG_LYRICS_BUDGET_MS;
-		for (let attempt = 1; attempt <= AISG_LYRICS_MAX_ATTEMPTS; attempt++) {
-			const remainingMs = deadline - Date.now();
-			if (remainingMs <= 0) {
-				throw new LyricsServiceError('timeout');
-			}
-			aisgAttempts++;
-			const attemptPrompt = attempt === 1 ? trimmedPrompt : `${trimmedPrompt}${LANGUAGE_RETRY_REMINDER}`;
-			const result = await fetchAisgLyricsOnce(attemptPrompt, env, Math.min(10_000, remainingMs));
-			if (!hasUnexpectedChinese(guardPrompt, result)) {
-				const ms = Date.now() - startedAt;
-				const meta: LyricsGenerationMeta = {
-					service: 'aisonggenerator.io',
-					model: AISG_LYRICS_MODEL,
-					aisg_attempts: aisgAttempts,
-					cf_attempts: 0,
-					ms,
-					...(attemptFailures.length > 0 ? { fallbacks: attemptFailures } : {}),
-				};
-				console.log(
-					JSON.stringify({
-						event: 'lyrics_generated',
-						...(smolId ? { smol_id: smolId } : {}),
-						service: meta.service,
-						model: meta.model,
-						aisg_attempts: meta.aisg_attempts,
-						cf_attempts: meta.cf_attempts,
-						fallback_count: attemptFailures.length,
-						ms,
-					})
-				);
-				return {
-					...result,
-					model: AISG_LYRICS_MODEL,
-					meta,
-				};
-			}
-			attemptFailures.push({
-				service: 'aisonggenerator.io',
-				model: AISG_LYRICS_MODEL,
-				reason: 'unexpected_chinese',
-			});
-			console.warn(
-				JSON.stringify({
-					event: 'aisg_lyrics_unexpected_chinese',
-					...(smolId ? { smol_id: smolId } : {}),
-					attempt,
-					max_attempts: AISG_LYRICS_MAX_ATTEMPTS,
-				})
-			);
-		}
-		throw new LyricsServiceError('unexpected_chinese');
-	} catch (error) {
-		const detail = classifyLyricsFailure(error);
-		if (detail.reason !== 'unexpected_chinese') {
-			attemptFailures.push({
-				service: 'aisonggenerator.io',
-				model: AISG_LYRICS_MODEL,
-				reason: detail.reason,
-				...(detail.upstreamStatus !== undefined ? { upstream_status: detail.upstreamStatus } : {}),
-			});
-		}
-		const entry = {
-			service: 'aisonggenerator.io',
-			reason: detail.reason,
-			...(detail.upstreamStatus !== undefined ? { upstream_status: detail.upstreamStatus } : {}),
-		};
-		console.warn(JSON.stringify({ event: 'lyrics_service_failed', ...(smolId ? { smol_id: smolId } : {}), ...entry }));
-		serviceFailures.push(entry);
-	}
-
-	// 2) Fallback: Cloudflare Workers AI
+	// 1) Primary: Cloudflare AI (Unified Billing Fable 5.2 -> Opus 5.5 -> native @cf/ DeepSeek V4.1 -> GLM-5.3)
 	try {
 		const cfResult = await songWrite(env, trimmedPrompt, guardPrompt, smolId);
 		cfAttempts = cfResult.attempts;
@@ -266,7 +189,7 @@ export async function generateLyricsWithFallback(
 		const meta: LyricsGenerationMeta = {
 			service: 'cloudflare-ai',
 			model: cfResult.model,
-			aisg_attempts: aisgAttempts,
+			aisg_attempts: 0,
 			cf_attempts: cfAttempts,
 			ms,
 			...(attemptFailures.length > 0 ? { fallbacks: attemptFailures } : {}),
@@ -305,6 +228,63 @@ export async function generateLyricsWithFallback(
 		const entry = {
 			service: 'cloudflare-ai',
 			reason: 'all_models_failed' as const,
+		};
+		console.warn(JSON.stringify({ event: 'lyrics_service_failed', ...(smolId ? { smol_id: smolId } : {}), ...entry }));
+		serviceFailures.push(entry);
+	}
+
+	// 2) Emergency last-resort fallback: aisonggenerator.io (only if all 4 Cloudflare AI models fail)
+	try {
+		aisgAttempts = 1;
+		const result = await fetchAisgLyricsOnce(trimmedPrompt, env, AISG_EMERGENCY_TIMEOUT_MS);
+		if (hasUnexpectedChinese(guardPrompt, result)) {
+			attemptFailures.push({
+				service: 'aisonggenerator.io',
+				model: AISG_LYRICS_MODEL,
+				reason: 'unexpected_chinese',
+			});
+			throw new LyricsServiceError('unexpected_chinese');
+		}
+		const ms = Date.now() - startedAt;
+		const meta: LyricsGenerationMeta = {
+			service: 'aisonggenerator.io',
+			model: AISG_LYRICS_MODEL,
+			aisg_attempts: aisgAttempts,
+			cf_attempts: cfAttempts,
+			ms,
+			...(attemptFailures.length > 0 ? { fallbacks: attemptFailures } : {}),
+		};
+		console.log(
+			JSON.stringify({
+				event: 'lyrics_generated',
+				...(smolId ? { smol_id: smolId } : {}),
+				service: meta.service,
+				model: meta.model,
+				aisg_attempts: meta.aisg_attempts,
+				cf_attempts: meta.cf_attempts,
+				fallback_count: attemptFailures.length,
+				ms,
+			})
+		);
+		return {
+			...result,
+			model: AISG_LYRICS_MODEL,
+			meta,
+		};
+	} catch (error) {
+		const detail = classifyLyricsFailure(error);
+		if (detail.reason !== 'unexpected_chinese') {
+			attemptFailures.push({
+				service: 'aisonggenerator.io',
+				model: AISG_LYRICS_MODEL,
+				reason: detail.reason,
+				...(detail.upstreamStatus !== undefined ? { upstream_status: detail.upstreamStatus } : {}),
+			});
+		}
+		const entry = {
+			service: 'aisonggenerator.io',
+			reason: detail.reason,
+			...(detail.upstreamStatus !== undefined ? { upstream_status: detail.upstreamStatus } : {}),
 		};
 		console.warn(JSON.stringify({ event: 'lyrics_service_failed', ...(smolId ? { smol_id: smolId } : {}), ...entry }));
 		serviceFailures.push(entry);

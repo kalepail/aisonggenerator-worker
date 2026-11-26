@@ -786,11 +786,17 @@ test("upstream errors release unread response bodies and preserve status diagnos
 
 	upstreamPath = "/api/music/lyrics/generate";
 	upstreamStatus = 403;
+	const failingAiEnv = createEnv({
+		AI: {
+			run: async () => {
+				throw new Error("cf ai down");
+			},
+		},
+	});
 	const { result: lyrics, logs: lyricsLogs } = await captureConsole(() =>
-		request("/api/lyrics", { method: "POST", body: "write a folk song" })
+		workerMod.default.fetch(new Request("http://aisonggenerator-worker/api/lyrics", { method: "POST", body: "write a folk song" }), failingAiEnv)
 	);
-	assert.equal(lyrics.status, 200);
-	assert.equal((await lyrics.json()).service, "cloudflare-ai");
+	assert.equal(lyrics.status, 503);
 	assert.match(lyricsLogs, /"reason":"auth_error","upstream_status":403/);
 
 	const stub = workerMod.getProviderStateStub(env);
@@ -858,12 +864,6 @@ test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, 
 		assert.equal(malformedJsonRes.status, 400);
 		assert.equal(fetchCalls, 0);
 
-		globalThis.fetch = async () =>
-			Response.json({
-				title: "Plain Text Ballad",
-				lyrics: "[Verse 1]\nSimple words",
-				tags: "indie folk, acoustic guitar",
-			});
 		const plainTextRes = await workerMod.default.fetch(
 			new Request("http://aisonggenerator-worker/api/lyrics", {
 				method: "POST",
@@ -873,24 +873,8 @@ test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, 
 			env
 		);
 		assert.equal(plainTextRes.status, 200);
-		assert.equal((await plainTextRes.json()).title, "Plain Text Ballad");
-
-		globalThis.fetch = async () =>
-			Response.json({
-				title: "Too Few Tags",
-				lyrics: "[Verse 1]\nShort line",
-				tags: "ambient",
-			});
-		const fallbackRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/lyrics", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ prompt: "foggy harbor dream pop" }),
-			}),
-			env
-		);
-		assert.equal(fallbackRes.status, 200);
-		assert.equal((await fallbackRes.json()).service, "cloudflare-ai");
+		assert.equal((await plainTextRes.json()).title, "Harbor Mist");
+		assert.equal(fetchCalls, 0);
 
 		const canary = "SYNTHETIC_AI_BINDING_SECRET_999";
 		const failingEnv = createEnv({
@@ -900,6 +884,39 @@ test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, 
 				},
 			},
 		});
+		globalThis.fetch = async () =>
+			Response.json({
+				title: "Too Few Tags",
+				lyrics: "[Verse 1]\nShort line",
+				tags: "ambient",
+			});
+		const tooFewTagsRes = await workerMod.default.fetch(
+			new Request("http://aisonggenerator-worker/api/lyrics", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ prompt: "foggy harbor dream pop" }),
+			}),
+			failingEnv
+		);
+		assert.equal(tooFewTagsRes.status, 503);
+
+		globalThis.fetch = async () =>
+			Response.json({
+				title: "Emergency Fallback Ballad",
+				lyrics: "[Verse 1]\nSimple words",
+				tags: "indie folk, acoustic guitar",
+			});
+		const emergencyRes = await workerMod.default.fetch(
+			new Request("http://aisonggenerator-worker/api/lyrics", {
+				method: "POST",
+				headers: { "Content-Type": "text/plain" },
+				body: "acoustic folk song about morning coffee",
+			}),
+			failingEnv
+		);
+		assert.equal(emergencyRes.status, 200);
+		assert.equal((await emergencyRes.json()).service, "aisonggenerator.io");
+
 		globalThis.fetch = async () => new Response("error", { status: 502 });
 
 		const { result: failRes, logs } = await captureConsole(() =>
@@ -922,7 +939,7 @@ test("E2E POST /api/lyrics rejects malformed declared JSON, preserves raw text, 
 	}
 });
 
-for (const service of ["aisonggenerator.io", "cloudflare-ai"]) {
+for (const service of ["cloudflare-ai", "aisonggenerator.io"]) {
 	test(`E2E POST /api/lyrics uses the raw prompt for the ${service} Han guard`, async (t) => {
 		const han = { title: "夜班诗人", lyrics: "凌晨的办公室", style: ["folk", "acoustic"] };
 		const english = { title: "Harbor Mist", lyrics: "Fog on the dock", style: ["folk", "acoustic"] };
@@ -939,7 +956,15 @@ for (const service of ["aisonggenerator.io", "cloudflare-ai"]) {
 			return Response.json({ ...draft, tags: draft.style.join(", ") });
 		});
 		const env = createEnv({
-			AI: { run: async (_model, input) => ({ response: draftFor(input.messages[1].content) }) },
+			AI: {
+				run: async (_model, input) => {
+					if (service === "aisonggenerator.io") {
+						throw new Error("force emergency aisg fallback");
+					}
+					const userMsg = input.messages[input.messages.length - 1].content;
+					return { response: draftFor(userMsg) };
+				},
+			},
 		});
 		const wrap = (prompt, caption) => `# Prompt\r\n${prompt}\r\n\r\n        # Description\r\n${caption}`;
 		const englishPrompt = wrap("Dream pop about the harbor", "海港的霧");
@@ -961,6 +986,13 @@ for (const service of ["aisonggenerator.io", "cloudflare-ai"]) {
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(body),
 			}), env);
+			if (service === "aisonggenerator.io" && !allowsHan) {
+				// Emergency AISG fallback runs 1 attempt only and rejects unexpected Han cleanly.
+				assert.equal(res.status, 503, JSON.stringify(body));
+				assert.equal(seenPrompts.length, 1);
+				assert.equal(seenPrompts[0], body.prompt);
+				continue;
+			}
 			assert.equal(res.status, 200);
 			const result = await res.json();
 			assert.equal(result.service, service);
