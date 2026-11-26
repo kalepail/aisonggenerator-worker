@@ -158,10 +158,31 @@ test("Cloudflare AI (Anthropic Fable 5.2 low + json_schema) is primary and never
 		assert.equal(result.meta.cf_attempts, 1);
 		assert.equal(result.meta.fallbacks, undefined);
 		assert.equal(result.title, "Passenger Side");
-		assert.equal(result.style.length, 5);
+		assert.ok(result.style.length >= 5 && result.style.length <= 8);
+		assert.ok(result.style.every((tag) => !tag.includes(",") && tag.length <= 36), `expected crisp atomic tags, got ${JSON.stringify(result.style)}`);
 	} finally {
 		globalThis.fetch = origFetch;
 	}
+});
+
+test("normalizeStyleTags splits comma-packed phrases, drops verbose prose sentences, deduplicates, and caps at 8", () => {
+	const tags = cfMod.normalizeStyleTags([
+		"warm folk-pop Americana, cozy holiday feel.",
+		"close conversational lead vocal with family-style gang harmonies",
+		"fingerpicked acoustic guitar, upright piano, brushed drums, soft fiddle",
+		"92 BPM",
+		"dry close-mic tape warmth, bridge strips to guitar and voice, final chorus opens wide with handclaps",
+		"upright piano",
+		"handclaps",
+		"tape warmth",
+	]);
+	assert.ok(tags.length <= 8);
+	assert.ok(tags.every((t) => !t.includes(",") && t.length <= 36), `unexpected verbose tag: ${JSON.stringify(tags)}`);
+	assert.ok(tags.includes("upright piano"));
+	assert.ok(tags.includes("brushed drums"));
+	assert.ok(tags.includes("92 BPM"));
+	assert.equal(tags.filter((t) => t.toLowerCase() === "upright piano").length, 1);
+	assert.ok(!tags.some((t) => /bridge strips/i.test(t)));
 });
 
 test("parseAndValidateSong trims malformed key whitespace and accepts style/styles", () => {
