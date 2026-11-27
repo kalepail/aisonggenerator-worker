@@ -49,6 +49,9 @@ const PROVIDER_STATE_DO_NAME = 'v0.0.0';
 const AISG_CREDITS_STORAGE_KEY = 'aisg_credits';
 const AISG_HEALTH_STORAGE_KEY = 'aisg_health';
 const ATTEMPT_STORAGE_PREFIX = 'attempt:';
+// Keep completed receipts beyond the 30-day Workflows replay window.
+const COMPLETED_ATTEMPT_RETENTION_MS = 45 * 24 * 60 * 60 * 1000;
+const ATTEMPT_PRUNE_BATCH_SIZE = 128;
 
 const ALLOWED_HEALTH_ERRORS = new Set([
 	'AISG session token is missing',
@@ -132,7 +135,7 @@ export class DO extends DurableObject<Env> {
 
 	/**
 	 * Caller-supplied attempt receipt ledger (keyed by explicit Idempotency-Key / attempt_id).
-	 * Completed receipts are retained across lost responses and replays.
+	 * Completed receipts are retained across lost responses and replays for at least 45 days.
 	 * Unresolved (`in_flight` / `ambiguous`) attempts NEVER expire back into a fresh paid submit
 	 * and remain inspectable via getAttempt() for deliberate reconciliation.
 	 */
@@ -227,6 +230,32 @@ export class DO extends DurableObject<Env> {
 		return (await this.ctx.storage.get<AttemptReceipt>(`${ATTEMPT_STORAGE_PREFIX}${attemptId}`)) ?? null;
 	}
 
+	private async pruneExpiredAttempts(): Promise<void> {
+		const cutoff = Date.now() - COMPLETED_ATTEMPT_RETENTION_MS;
+		let startAfter: string | undefined;
+		do {
+			startAfter = await this.ctx.storage.transaction(async (txn) => {
+				const receipts = await txn.list<AttemptReceipt>({
+					prefix: ATTEMPT_STORAGE_PREFIX,
+					limit: ATTEMPT_PRUNE_BATCH_SIZE,
+					startAfter,
+				});
+				const expired: string[] = [];
+				let lastKey: string | undefined;
+				for (const [key, receipt] of receipts) {
+					lastKey = key;
+					if (receipt.status === 'completed' && Date.parse(receipt.updated_at) < cutoff) {
+						expired.push(key);
+					}
+				}
+				if (expired.length) {
+					await txn.delete(expired);
+				}
+				return receipts.size === ATTEMPT_PRUNE_BATCH_SIZE ? lastKey : undefined;
+			});
+		} while (startAfter !== undefined);
+	}
+
 	async getLastAisgCredits(): Promise<AisgCreditsSnapshot | null> {
 		return (await this.ctx.storage.get<AisgCreditsSnapshot>(AISG_CREDITS_STORAGE_KEY)) ?? null;
 	}
@@ -273,6 +302,7 @@ export class DO extends DurableObject<Env> {
 	// The site session is a Better Auth cookie whose DB expiration slides forward when get-session is called.
 	// This check confirms the session still signs in, tracks session expiry, and records the current credit balance.
 	async checkAisgSession(): Promise<AisgCreditsSnapshot> {
+		await this.pruneExpiredAttempts();
 		const checkedAt = new Date().toISOString();
 		const prevCredits = await this.getLastAisgCredits();
 

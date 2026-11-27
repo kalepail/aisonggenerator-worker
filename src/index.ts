@@ -9,7 +9,7 @@ import {
 } from './api/aisonggenerator';
 import { ProviderError, classifyUnexpectedErrorCategory } from './api/errors';
 import { extractSmolId, lyrics } from './api/lyrics';
-import { getSongs, getTask, postSongs, postTask } from './api/songs';
+import { getSongs, getTask, postTask } from './api/songs';
 import {
 	getProviderStateStub,
 	sanitizeHealthErrorMessage,
@@ -120,7 +120,6 @@ app
 	.post('/api/lyrics', lyrics)
 	.post('/api/tasks', postTask)
 	.get('/api/tasks/:id', getTask)
-	.post('/api/songs', postSongs)
 	.get('/api/songs', getSongs)
 	.onError((err, ctx) => {
 		const smolId = extractSmolId(ctx.req.header('x-smol-id'));

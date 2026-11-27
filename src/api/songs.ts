@@ -5,7 +5,6 @@ import {
 	aisgAuthHeaders,
 	buildSubmitBody,
 	discoverAiSongGeneratorTaskMusicIds,
-	findMusicIds,
 	getAiSongGeneratorSongResults,
 	submitAiSongGeneratorTask,
 } from './aisonggenerator';
@@ -318,64 +317,4 @@ export async function getSongs(ctx: Context<{ Bindings: Env }>) {
 
 	const results: AiSongGeneratorSong[] = await getAiSongGeneratorSongResults(ids, env);
 	return ctx.json(results);
-}
-
-export async function postSongs(ctx: Context<{ Bindings: Env }>) {
-	assertAisgOnlySource(ctx.req.query('source'));
-	const { params, attemptId, rawPrompt } = await parseSongRequest(ctx);
-
-	// Unkeyed legacy caller (without Idempotency-Key / attempt_id):
-	// never share DO state across independent requests, and preserve 6af87b5 non-retrying behavior
-	// when a single song is visible at loop exhaustion so unkeyed callers do not re-pay AISG.
-	if (!attemptId) {
-		const receipt = await submitAiSongGeneratorTask(params, ctx.env);
-		const musicIds = await findMusicIds(ctx.env, receipt.task_id, receipt.workspace_id, {
-			allowSingletonOnExhaustion: true,
-		});
-		return ctx.json(musicIds);
-	}
-
-	// Keyed caller with explicit Idempotency-Key / attempt_id:
-	// retain completed receipts across response loss & replay, never expire unresolved attempts,
-	// and require full 2-track discovery before completing.
-	const submitBody = buildSubmitBody(params, ctx.env);
-	aisgAuthHeaders(ctx.env, true);
-	const payloadHash = await computeAttemptPayloadHash(submitBody, rawPrompt);
-	const stub = getProviderStateStub(ctx.env);
-	const claim = await stub.claimAttempt(attemptId, payloadHash);
-
-	if (claim.action === 'conflict') {
-		throw conflictError();
-	}
-
-	if (claim.action === 'existing') {
-		const existing = claim.receipt;
-		if (existing.status === 'completed' && existing.music_ids) {
-			return ctx.json(existing.music_ids);
-		}
-		if (existing.status === 'accepted' && existing.task_id) {
-			const musicIds = await findMusicIds(ctx.env, existing.task_id, existing.workspace_id);
-			await stub.recordAttemptCompleted(attemptId, payloadHash, existing.task_id, musicIds, existing.workspace_id);
-			return ctx.json(musicIds);
-		}
-		throw unresolvedAttemptError();
-	}
-
-	let receipt: { task_id: string; workspace_id?: string };
-	try {
-		receipt = await submitAiSongGeneratorTask(params, ctx.env);
-	} catch (error) {
-		if (error instanceof ProviderError && error.outcome === 'rejected') {
-			await stub.clearAttempt(attemptId);
-		} else {
-			await stub.recordAttemptAmbiguous(attemptId, payloadHash);
-		}
-		throw error;
-	}
-
-	await stub.recordAttemptAccepted(attemptId, payloadHash, receipt.task_id, receipt.workspace_id);
-
-	const musicIds = await findMusicIds(ctx.env, receipt.task_id, receipt.workspace_id);
-	await stub.recordAttemptCompleted(attemptId, payloadHash, receipt.task_id, musicIds, receipt.workspace_id);
-	return ctx.json(musicIds);
 }

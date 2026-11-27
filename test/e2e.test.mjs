@@ -169,7 +169,7 @@ test("E2E split AISG submit (POST /api/tasks), multi-page discovery (GET /api/ta
 		assert.equal(upstreamBody.vocalGender, taskBody.vocalGender);
 		assert.equal(upstreamBody.negativeTags, taskBody.negativeTags);
 
-		for (const change of [{ vocalGender: "m" }, { negativeTags: "brass" }]) {
+		for (const change of [{ vocalGender: "m" }, { negativeTags: "brass" }, { prompt: "Changed prompt" }]) {
 			const conflictRes = await submitTask({ ...taskBody, ...change });
 			assert.equal(conflictRes.status, 409);
 			assert.equal((await conflictRes.json()).code, "idempotency_conflict");
@@ -180,6 +180,24 @@ test("E2E split AISG submit (POST /api/tasks), multi-page discovery (GET /api/ta
 		assert.equal(replayRes.status, 200);
 		assert.deepEqual(await replayRes.json(), { task_id: "task_split_1", workspace_id: "ws_page3" });
 		assert.equal(seenRequests.length, 1);
+
+		const stub = workerMod.getProviderStateStub(env);
+		const attemptId = "task-attempt-key-0001";
+		const accepted = await stub.getAttempt(attemptId);
+		assert.equal(accepted.status, "accepted");
+		await stub.recordAttemptCompleted(attemptId, accepted.payload_hash, accepted.task_id, ["m_alpha", "m_beta"], accepted.workspace_id);
+
+		const completedReplay = await submitTask(taskBody);
+		assert.equal(completedReplay.status, 200);
+		assert.deepEqual(await completedReplay.json(), { task_id: "task_split_1", workspace_id: "ws_page3" });
+		assert.equal(seenRequests.length, 1);
+
+		const publicAttempt = await workerMod.default.fetch(
+			new Request(`http://aisonggenerator-worker/api/attempts/${attemptId}`),
+			env
+		);
+		assert.equal(publicAttempt.status, 404);
+		assert.deepEqual((await stub.getAttempt(attemptId)).music_ids, ["m_alpha", "m_beta"]);
 
 		// 2) Both matches on page 3 -> discovered in a single bounded lookup
 		const page3Res = await workerMod.default.fetch(
@@ -258,41 +276,14 @@ test("E2E split AISG submit (POST /api/tasks), multi-page discovery (GET /api/ta
 	}
 });
 
-test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambiguous claim, isolated independent requests, and 100-page page-1 recheck", async () => {
+test("E2E task validation, ambiguous replay, and independent unkeyed submissions", async (t) => {
 	const origFetch = globalThis.fetch;
-	const origSetTimeout = globalThis.setTimeout;
-	const origDateNow = Date.now;
 	const env = createEnv();
 
-	globalThis.setTimeout = (fn, _ms, ...args) => origSetTimeout(fn, 0, ...args);
-
 	try {
-		// 1) Keyed POST /api/songs:
-		//    - Attempt 1 submits ONCE, discovery exhausts at 1 song -> 504 (retained as accepted)
-		//    - Attempt 2 resumes SAME task_id -> discovers both -> retained as completed -> 200 ["id_1", "id_2"]
-		//    - Attempt 3 (simulating LOST 200 response replay!) returns identical ["id_1", "id_2"] with 0 upstream calls!
-		let keyedSubmits = 0;
-		let keyedListCalls = 0;
-		globalThis.fetch = async (url) => {
-			const urlStr = String(url);
-			if (urlStr.endsWith("/api/music/submit")) {
-				keyedSubmits++;
-				return Response.json({ success: true, data: { task_id: "task_keyed_1" } });
-			}
-			if (urlStr.includes("/api/music/list")) {
-				keyedListCalls++;
-				const items =
-					keyedListCalls <= 6
-						? [{ task_id: "task_keyed_1", music_id: "id_2" }]
-						: [
-								{ task_id: "task_keyed_1", music_id: "id_2" },
-								{ task_id: "task_keyed_1", music_id: "id_1" },
-							];
-				return Response.json({ success: true, data: { items, pagination: { page: 1, totalPages: 1 } } });
-			}
-			throw new Error(`Unexpected URL: ${urlStr}`);
-		};
-
+		const invalidFetch = t.mock.method(globalThis, "fetch", async () => {
+			throw new Error("Should not call upstream on invalid inputs");
+		});
 		const keyedPayload = JSON.stringify({
 			title: "Rainy Keys",
 			style: ["lofi"],
@@ -301,78 +292,9 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 			public: false,
 		});
 
-		const keyed1 = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs", {
-				method: "POST",
-				headers: { "Content-Type": "application/json", "Idempotency-Key": "gen-keyed-attempt-0001" },
-				body: keyedPayload,
-			}),
-			env
-		);
-		assert.equal(keyed1.status, 504);
-		assert.equal((await keyed1.json()).task_id, "task_keyed_1");
-		assert.equal(keyedSubmits, 1);
-
-		const keyed2 = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs", {
-				method: "POST",
-				headers: { "Content-Type": "application/json", "Idempotency-Key": "gen-keyed-attempt-0001" },
-				body: keyedPayload,
-			}),
-			env
-		);
-		assert.equal(keyed2.status, 200);
-		assert.deepEqual(await keyed2.json(), ["id_1", "id_2"]);
-		assert.equal(keyedSubmits, 1);
-
-		// Discard keyed2's response and replay — MUST return same pair with ZERO upstream calls!
-		const listCountBeforeReplay = keyedListCalls;
-		const keyed3LostSuccessReplay = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs", {
-				method: "POST",
-				headers: { "Content-Type": "application/json", "Idempotency-Key": "gen-keyed-attempt-0001" },
-				body: keyedPayload,
-			}),
-			env
-		);
-		assert.equal(keyed3LostSuccessReplay.status, 200);
-		assert.deepEqual(await keyed3LostSuccessReplay.json(), ["id_1", "id_2"]);
-		assert.equal(keyedSubmits, 1);
-		assert.equal(keyedListCalls, listCountBeforeReplay);
-
-		// Public GET /api/attempts/:id MUST NOT be exposed over HTTP (404), while internal DO.getAttempt() retains receipt
-		const publicAttemptRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/attempts/gen-keyed-attempt-0001"),
-			env
-		);
-		assert.equal(publicAttemptRes.status, 404);
-		const internalStub = env.DURABLE_OBJECT.get(env.DURABLE_OBJECT.idFromName("v0.0.0"));
-		const internalReceipt = await internalStub.getAttempt("gen-keyed-attempt-0001");
-		assert.equal(internalReceipt.status, "completed");
-		assert.equal(internalReceipt.task_id, "task_keyed_1");
-		assert.deepEqual(internalReceipt.music_ids, ["id_1", "id_2"]);
-
-		// Reusing same Idempotency-Key with a DIFFERENT payload returns 409 idempotency_conflict (no receipt disclosure)
-		const conflictRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs", {
-				method: "POST",
-				headers: { "Content-Type": "application/json", "Idempotency-Key": "gen-keyed-attempt-0001" },
-				body: JSON.stringify({
-					title: "Different Song",
-					style: ["jazz"],
-					instrumental: true,
-					prompt: "Different prompt",
-					public: false,
-				}),
-			}),
-			env
-		);
-		assert.equal(conflictRes.status, 409);
-		assert.equal((await conflictRes.json()).code, "idempotency_conflict");
-
 		// Short guessable keys (<16 chars) rejected with 400 before dispatch
 		const shortKeyRes = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs", {
+			new Request("http://aisonggenerator-worker/api/tasks", {
 				method: "POST",
 				headers: { "Content-Type": "application/json", "Idempotency-Key": "a" },
 				body: keyedPayload,
@@ -381,8 +303,10 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 		);
 		assert.equal(shortKeyRes.status, 400);
 		assert.equal((await shortKeyRes.json()).code, "invalid_request");
+		assert.equal(invalidFetch.mock.callCount(), 0);
+		invalidFetch.mock.restore();
 
-		// 2) Unresolved/ambiguous keyed attempt NEVER expires back into a fresh submit — even after 24 hours!
+		// An ambiguous attempt still refuses a duplicate submit after 24 hours.
 		let ambigSubmits = 0;
 		globalThis.fetch = async (url) => {
 			if (String(url).endsWith("/api/music/submit")) {
@@ -400,7 +324,7 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 			public: false,
 		});
 		const ambig1 = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs", {
+			new Request("http://aisonggenerator-worker/api/tasks", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: ambigPayload,
@@ -412,11 +336,11 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 		assert.equal(ambigSubmits, 1);
 
 		// Simulate +15 minutes and +24 hours clock advance — unresolved attempt must STILL refuse duplicate submit!
-		const baseNow = origDateNow();
+		const baseNow = Date.now();
 		for (const deltaMs of [15 * 60 * 1000, 24 * 60 * 60 * 1000]) {
-			Date.now = () => baseNow + deltaMs;
+			const clock = t.mock.method(Date, "now", () => baseNow + deltaMs);
 			const delayedRetry = await workerMod.default.fetch(
-				new Request("http://aisonggenerator-worker/api/songs", {
+				new Request("http://aisonggenerator-worker/api/tasks", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: ambigPayload,
@@ -428,38 +352,27 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 			assert.equal(delayedBody.code, "aisg_dispatch_unknown");
 			assert.equal(delayedBody.outcome, "unknown");
 			assert.equal(ambigSubmits, 1);
+			clock.mock.restore();
 		}
-		Date.now = origDateNow;
 
-		assert.equal((await internalStub.getAttempt("gen-ambig-attempt-0001")).status, "ambiguous");
+		const stub = workerMod.getProviderStateStub(env);
+		assert.equal((await stub.getAttempt("gen-ambig-attempt-0001")).status, "ambiguous");
 
-		// 3) Independent unkeyed vocal requests with DIFFERENT original prompts and IDENTICAL title/lyrics/style/visibility
-		//    MUST NOT share a receipt or return generation A's tracks to generation B!
+		// Independent unkeyed requests each submit a separate task.
 		let nextTaskSeq = 0;
-		const readyByTask = new Map();
 		globalThis.fetch = async (url) => {
 			const urlStr = String(url);
 			if (urlStr.endsWith("/api/music/submit")) {
 				nextTaskSeq++;
 				const taskId = `task_indep_${nextTaskSeq}`;
-				readyByTask.set(taskId, [`${taskId}_a`, `${taskId}_b`]);
 				return Response.json({ success: true, data: { task_id: taskId } });
-			}
-			if (urlStr.includes("/api/music/list")) {
-				const items = [];
-				for (const [taskId, pair] of readyByTask.entries()) {
-					for (const musicId of pair) {
-						items.push({ task_id: taskId, music_id: musicId });
-					}
-				}
-				return Response.json({ success: true, data: { items, pagination: { page: 1, totalPages: 1 } } });
 			}
 			throw new Error(`Unexpected URL: ${urlStr}`);
 		};
 
 		const makeVocalReq = (prompt) =>
 			workerMod.default.fetch(
-				new Request("http://aisonggenerator-worker/api/songs?source=aisonggenerator", {
+				new Request("http://aisonggenerator-worker/api/tasks?source=aisonggenerator", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({
@@ -480,66 +393,17 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 		]);
 		assert.equal(indepResA.status, 200);
 		assert.equal(indepResB.status, 200);
-		const pairA = await indepResA.json();
-		const pairB = await indepResB.json();
+		const taskIds = [(await indepResA.json()).task_id, (await indepResB.json()).task_id];
+		assert.deepEqual(taskIds.sort(), ["task_indep_1", "task_indep_2"]);
 		assert.equal(nextTaskSeq, 2);
-		assert.notDeepEqual(pairA, pairB);
-		assert.equal(pairA.length, 2);
-		assert.equal(pairB.length, 2);
 
-		// 4) Unkeyed legacy POST /api/songs on 100-page library where page 2 transiently returns 503
-		//    and page 1 exposes both IDs on its 2nd read: MUST succeed with 1 paid submit (no 503 abort!)
-		let deepPage1Reads = 0;
-		let deepSubmits = 0;
-		globalThis.fetch = async (url) => {
-			const urlStr = String(url);
-			if (urlStr.endsWith("/api/music/submit")) {
-				deepSubmits++;
-				return Response.json({ success: true, data: { task_id: "task_100p" } });
-			}
-			if (urlStr.includes("/api/music/list")) {
-				const page = Number(new URL(urlStr).searchParams.get("page"));
-				if (page === 1) {
-					deepPage1Reads++;
-					const items =
-						deepPage1Reads >= 2
-							? [
-									{ task_id: "task_100p", music_id: "p1_b" },
-									{ task_id: "task_100p", music_id: "p1_a" },
-								]
-							: [];
-					return Response.json({ success: true, data: { items, pagination: { page: 1, totalPages: 100 } } });
-				}
-				return new Response("Service Unavailable", { status: 503 });
-			}
-			throw new Error(`Unexpected URL: ${urlStr}`);
-		};
-
-		const page100Res = await workerMod.default.fetch(
-			new Request("http://aisonggenerator-worker/api/songs?source=aisonggenerator", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: keyedPayload,
-			}),
-			env
-		);
-		assert.equal(page100Res.status, 200);
-		assert.deepEqual(await page100Res.json(), ["p1_a", "p1_b"]);
-		assert.equal(deepSubmits, 1);
-		assert.equal(deepPage1Reads, 2);
-
-		// 5) Step-6 contraction: DiffRhythm, Suno, malformed inputs, and wildcard CORS are all rejected/absent
+		// Reject unsupported sources and malformed requests before calling upstream.
 		let unexpectedCalls = 0;
 		globalThis.fetch = async () => {
 			unexpectedCalls++;
 			throw new Error("Should not call upstream on invalid inputs");
 		};
 		for (const req of [
-			new Request("http://aisonggenerator-worker/api/songs?source=diffrhythm", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: keyedPayload,
-			}),
 			new Request("http://aisonggenerator-worker/api/songs?source=diffrhythm&ids=diff_task_1,diff_task_2"),
 			new Request("http://aisonggenerator-worker/api/tasks?source=diffrhythm", {
 				method: "POST",
@@ -585,8 +449,6 @@ test("E2E paid replay invariants: keyed lost-success replay, non-expiring ambigu
 		assert.equal(preflightRes.headers.get("access-control-allow-origin"), null);
 	} finally {
 		globalThis.fetch = origFetch;
-		globalThis.setTimeout = origSetTimeout;
-		Date.now = origDateNow;
 	}
 });
 
@@ -1003,6 +865,38 @@ for (const service of ["cloudflare-ai", "aisonggenerator.io"]) {
 	});
 }
 
+test("ProviderState prunes only completed attempt receipts last updated more than 45 days ago", async (t) => {
+	const now = Date.parse("2026-11-27T00:00:00Z");
+	t.mock.method(Date, "now", () => now);
+	const daysAgo = (days) => new Date(now - days * 86_400_000).toISOString();
+	const env = createEnv({ AISONGGENERATOR_SESSION_TOKEN: "" });
+	const stub = workerMod.getProviderStateStub(env);
+	const store = env.DURABLE_OBJECT.stores.get("v0.0.0");
+	const receipts = [
+		["expired", "completed", 46],
+		["recent", "completed", 20],
+		["boundary", "completed", 45],
+		["ambiguous", "ambiguous", 60],
+		["in-flight", "in_flight", 60],
+		["accepted", "accepted", 60],
+	].map(([id, status, age]) => ({
+		attempt_id: id,
+		payload_hash: "test-hash",
+		status,
+		created_at: daysAgo(60),
+		updated_at: daysAgo(age),
+	}));
+	for (const receipt of receipts) {
+		store.set(`attempt:${receipt.attempt_id}`, receipt);
+	}
+
+	await assert.rejects(stub.checkAisgSession(), { code: "aisg_auth_error" });
+	assert.equal(await stub.getAttempt("expired"), null);
+	for (const receipt of receipts.slice(1)) {
+		assert.deepEqual(await stub.getAttempt(receipt.attempt_id), receipt);
+	}
+});
+
 test("E2E scheduled() cron preserves existing state, 0-credit GET /health, and closed-set error categories (no custom error.name leaks)", async () => {
 	const origFetch = globalThis.fetch;
 	const env = createEnv();
@@ -1037,16 +931,6 @@ test("E2E scheduled() cron preserves existing state, 0-credit GET /health, and c
 		assert.equal(fetchCalls, 0);
 
 		doStore.set("session_token", "__Secure-next-auth.session-token=stored-diff-tok");
-		const oldReceipt = {
-			attempt_id: "gen-old-completed-0001",
-			payload_hash: "test-hash",
-			status: "completed",
-			task_id: "task-1",
-			music_ids: ["one", "two"],
-			created_at: "2025-01-01T00:00:00.000Z",
-			updated_at: "2025-01-01T00:00:00.000Z",
-		};
-		doStore.set("attempt:gen-old-completed-0001", oldReceipt);
 		globalThis.fetch = async (url) => {
 			const urlStr = String(url);
 			if (urlStr === "https://aisonggenerator.io/api/auth/get-session") {
@@ -1074,7 +958,6 @@ test("E2E scheduled() cron preserves existing state, 0-credit GET /health, and c
 
 		await workerMod.default.scheduled({}, env, {});
 		assert.equal(doStore.get("session_token"), "__Secure-next-auth.session-token=stored-diff-tok");
-		assert.deepEqual(doStore.get("attempt:gen-old-completed-0001"), oldReceipt);
 		assert.ok(doStore.has("aisg_credits"));
 		assert.ok(doStore.has("aisg_health"));
 

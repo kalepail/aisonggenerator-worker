@@ -335,15 +335,20 @@ test("Native @cf/ spend_limit stops immediately without trying further native mo
 	assert.deepEqual(modelsCalled, [cfMod.TERTIARY_LYRICS_MODEL]);
 });
 
-test("songWrite reserves fallback time for native @cf/ models and aborts stalled calls cleanly", async (t) => {
+async function assertLyricsTimeout(t, gatewayId) {
 	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
 	const calls = [];
 	const env = {
-		CF_AI_GATEWAY_ID: "test-gateway",
+		CF_AI_GATEWAY_ID: gatewayId,
 		AI: {
 			run(model, _input, options) {
-				calls.push({ model, at: Date.now(), signal: options.signal });
-				return new Promise(() => {});
+				const { signal, gateway } = options;
+				calls.push({ model, at: Date.now(), signal, gateway });
+				return gatewayId
+					? new Promise(() => {})
+					: new Promise((_, reject) => {
+						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					});
 			},
 		},
 	};
@@ -372,8 +377,20 @@ test("songWrite reserves fallback time for native @cf/ models and aborts stalled
 			[cfMod.TERTIARY_LYRICS_MODEL, 36_000],
 		]
 	);
-	assert.ok(calls.every(({ signal }) => signal.aborted));
-});
+	for (const { signal, gateway } of calls) {
+		assert.equal(signal.aborted, true);
+		assert.equal(signal.reason.name, "TimeoutError");
+		assert.deepEqual(gateway, gatewayId ? { id: gatewayId } : undefined);
+	}
+}
+
+test("songWrite reserves fallback time and aborts stalled calls through an AI Gateway", (t) =>
+	assertLyricsTimeout(t, "test-gateway"),
+);
+
+test("songWrite aborts stalled calls without an AI Gateway", (t) =>
+	assertLyricsTimeout(t),
+);
 
 test("Emergency aisonggenerator.io fallback activates only if all Cloudflare AI models fail, and logs correlate X-Smol-Id", async (t) => {
 	const logs = [];

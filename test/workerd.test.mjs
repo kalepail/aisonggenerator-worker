@@ -43,11 +43,13 @@ test("workerd loads every Worker route, Durable Object and cron", async (t) => {
 		assert.equal(initial.headers.get("cache-control"), "no-store");
 		assert.equal((await initial.json()).status, "unknown");
 
+		const retired = await worker.fetch("/api/songs", { method: "POST" });
+		assert.equal(retired.status, 404);
+
 		for (const [method, path, error] of [
 			["POST", "/api/lyrics", "Invalid JSON request body"],
 			["POST", "/api/tasks", "Invalid JSON request body"],
 			["GET", "/api/tasks/smoke?page=0", "'page' query parameter must be a positive integer"],
-			["POST", "/api/songs", "Invalid JSON request body"],
 			["GET", "/api/songs", "'ids' query parameter is required"],
 		]) {
 			const request = method === "POST"

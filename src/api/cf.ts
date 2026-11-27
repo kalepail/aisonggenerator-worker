@@ -263,7 +263,7 @@ function runLyricsModel<Model extends LyricsModel>(
 	const gatewayId = env.CF_AI_GATEWAY_ID?.trim();
 	return gatewayId
 		? env.AI.run(model, input, { gateway: { id: gatewayId }, signal })
-		: env.AI.run(model, input);
+		: env.AI.run(model, input, { signal });
 }
 
 function runAnthropicLyrics(

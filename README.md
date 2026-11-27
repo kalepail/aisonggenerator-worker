@@ -9,9 +9,8 @@ Cloudflare Worker for AISongGenerator song generation, polling, and lyrics. Cons
 | `POST /api/tasks` | Submit a paid task and return its provider task ID. |
 | `GET /api/tasks/:id` | Discover song IDs for a submitted task with optional `workspace_id` and `page` queries. |
 | `GET /api/songs?ids=...` | Poll up to 20 comma-separated song IDs. |
-| `POST /api/songs` | Submit a paid task and return song IDs through the legacy combined endpoint. |
 
-Send an `Idempotency-Key` header or an `attempt_id` field on paid submissions to make retries replay-safe.
+Send an `Idempotency-Key` header or an `attempt_id` field on paid submissions to make retries replay-safe. The cron prunes completed receipts whose last update was more than 45 days ago.
 
 ## Bindings and configuration
 

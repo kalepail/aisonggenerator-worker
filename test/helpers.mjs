@@ -77,17 +77,19 @@ export function createMockDoNamespace(DOClass, getEnv) {
 							map.set(key, structuredClone(value));
 						},
 						async delete(key) {
+							if (Array.isArray(key)) {
+								return key.filter((entry) => map.delete(entry)).length;
+							}
 							return map.delete(key);
 						},
-						async list(options = {}) {
-							const prefix = options?.prefix ?? "";
-							const out = new Map();
-							for (const [k, v] of map.entries()) {
-								if (!prefix || k.startsWith(prefix)) {
-									out.set(k, structuredClone(v));
-								}
-							}
-							return out;
+						async list({ prefix = "", startAfter = "", limit = map.size } = {}) {
+							const keys = [...map.keys()].sort()
+								.filter((key) => key.startsWith(prefix) && key > startAfter)
+								.slice(0, limit);
+							return new Map(keys.map((key) => [key, structuredClone(map.get(key))]));
+						},
+						async transaction(callback) {
+							return callback(this);
 						},
 					},
 				};
